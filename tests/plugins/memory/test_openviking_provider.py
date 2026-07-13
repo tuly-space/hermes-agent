@@ -1212,6 +1212,39 @@ def test_tool_search_sends_limit_not_legacy_top_k():
     assert "mode" not in payload
 
 
+def test_tool_search_deduplicates_by_uri_and_enforces_limit():
+    provider = OpenVikingMemoryProvider()
+    provider._client = MagicMock()
+    provider._client.post.return_value = {
+        "result": {
+            "memories": [
+                {"uri": "viking://memories/shared", "score": 0.4, "abstract": "lower"},
+                {"uri": "viking://memories/second", "score": 0.8, "abstract": "second"},
+            ],
+            "resources": [
+                {"uri": "viking://memories/shared", "score": 0.9, "abstract": "higher"},
+                {"uri": "viking://resources/third", "score": 0.7, "abstract": "third"},
+            ],
+            "skills": [],
+            "total": 4,
+        }
+    }
+
+    result = json.loads(provider._tool_search({
+        "query": "deduplicate",
+        "mode": "deep",
+        "limit": 2,
+    }))
+
+    assert [entry["uri"] for entry in result["results"]] == [
+        "viking://memories/shared",
+        "viking://memories/second",
+    ]
+    assert result["results"][0]["score"] == 0.9
+    assert result["results"][0]["abstract"] == "higher"
+    assert result["total"] == 2
+
+
 def test_tool_search_uses_find_for_normal_search():
     provider = OpenVikingMemoryProvider()
     provider._client = MagicMock()
@@ -1262,14 +1295,48 @@ def test_tool_add_resource_uploads_existing_local_file(tmp_path):
     }))
 
     provider._client.upload_temp_file.assert_called_once_with(sample)
-    provider._client.post.assert_called_once_with("/api/v1/resources", {
-        "reason": "local test",
-        "wait": True,
-        "source_name": "sample.md",
-        "temp_file_id": "upload_sample.md",
-    })
+    provider._client.post.assert_called_once_with(
+        "/api/v1/resources",
+        {
+            "reason": "local test",
+            "wait": True,
+            "source_name": "sample.md",
+            "temp_file_id": "upload_sample.md",
+        },
+        timeout=305.0,
+    )
     assert result["status"] == "added"
     assert result["root_uri"] == "viking://resources/sample"
+
+
+def test_tool_add_resource_wait_uses_requested_timeout_plus_response_margin(tmp_path):
+    sample = tmp_path / "sample.md"
+    sample.write_text("# Local resource\n", encoding="utf-8")
+    provider = OpenVikingMemoryProvider()
+    provider._client = MagicMock()
+    provider._client.upload_temp_file.return_value = "upload_sample.md"
+    provider._client.post.return_value = {
+        "status": "ok",
+        "result": {"root_uri": "viking://resources/sample"},
+    }
+
+    result = json.loads(provider._tool_add_resource({
+        "url": str(sample),
+        "wait": True,
+        "timeout": 180,
+    }))
+
+    provider._client.post.assert_called_once_with(
+        "/api/v1/resources",
+        {
+            "wait": True,
+            "timeout": 180,
+            "source_name": "sample.md",
+            "temp_file_id": "upload_sample.md",
+        },
+        timeout=185.0,
+    )
+    assert result["status"] == "added"
 
 
 def test_tool_add_resource_uploads_file_uri(tmp_path):
@@ -1345,12 +1412,16 @@ def test_tool_add_resource_uploads_existing_local_directory_and_cleans_zip(tmp_p
     assert uploaded_paths
     assert uploaded_paths[0].suffix == ".zip"
     assert not uploaded_paths[0].exists()
-    provider._client.post.assert_called_once_with("/api/v1/resources", {
-        "reason": "directory test",
-        "wait": True,
-        "source_name": "docs",
-        "temp_file_id": "upload_docs.zip",
-    })
+    provider._client.post.assert_called_once_with(
+        "/api/v1/resources",
+        {
+            "reason": "directory test",
+            "wait": True,
+            "source_name": "docs",
+            "temp_file_id": "upload_docs.zip",
+        },
+        timeout=305.0,
+    )
     assert result["status"] == "added"
     assert result["root_uri"] == "viking://resources/docs"
 

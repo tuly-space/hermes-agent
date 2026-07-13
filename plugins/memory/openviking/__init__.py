@@ -68,6 +68,8 @@ _OPENVIKING_ENV_KEYS = (
     "OPENVIKING_AGENT",
 )
 _TIMEOUT = 30.0
+_RESOURCE_WAIT_TIMEOUT = 300.0
+_RESOURCE_WAIT_RESPONSE_MARGIN = 5.0
 _SESSION_DRAIN_TIMEOUT = 10.0
 _DEFERRED_COMMIT_TIMEOUT = (_TIMEOUT * 2) + 5.0
 _REMOTE_RESOURCE_PREFIXES = ("http://", "https://", "git@", "ssh://", "git://")
@@ -3422,12 +3424,30 @@ class OpenVikingMemoryProvider(MemoryProvider):
                     entry["related"] = [r.get("uri") for r in item["relations"][:3]]
                 scored_entries.append((sort_score, entry))
 
+        # Deep search can return the same URI from multiple reasoning plans or
+        # context buckets. Keep the highest-scoring representation so repeated
+        # evidence does not consume the caller's result budget.
+        best_by_uri: Dict[str, tuple[float, dict]] = {}
+        unkeyed_entries = []
+        for sort_score, entry in scored_entries:
+            uri = entry.get("uri", "")
+            if not uri:
+                unkeyed_entries.append((sort_score, entry))
+                continue
+            current = best_by_uri.get(uri)
+            if current is None or sort_score > current[0]:
+                best_by_uri[uri] = (sort_score, entry)
+
+        scored_entries = list(best_by_uri.values()) + unkeyed_entries
         scored_entries.sort(key=lambda x: x[0], reverse=True)
+        limit = args.get("limit")
+        if isinstance(limit, int) and not isinstance(limit, bool) and limit > 0:
+            scored_entries = scored_entries[:limit]
         formatted = [entry for _, entry in scored_entries]
 
         return json.dumps({
             "results": formatted,
-            "total": result.get("total", len(formatted)),
+            "total": len(formatted),
         }, ensure_ascii=False)
 
     def _read_uri_payload(
@@ -3703,7 +3723,25 @@ class OpenVikingMemoryProvider(MemoryProvider):
             else:
                 payload["path"] = url
 
-            resp = self._client.post("/api/v1/resources", payload)
+            if payload.get("wait"):
+                requested_timeout = payload.get("timeout", _RESOURCE_WAIT_TIMEOUT)
+                try:
+                    requested_timeout = float(requested_timeout)
+                except (TypeError, ValueError):
+                    requested_timeout = _RESOURCE_WAIT_TIMEOUT
+                if requested_timeout <= 0:
+                    requested_timeout = _RESOURCE_WAIT_TIMEOUT
+                http_timeout = max(
+                    _TIMEOUT,
+                    requested_timeout + _RESOURCE_WAIT_RESPONSE_MARGIN,
+                )
+                resp = self._client.post(
+                    "/api/v1/resources",
+                    payload,
+                    timeout=http_timeout,
+                )
+            else:
+                resp = self._client.post("/api/v1/resources", payload)
             result = resp.get("result", {})
         finally:
             if cleanup_path:
