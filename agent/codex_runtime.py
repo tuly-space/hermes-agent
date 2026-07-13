@@ -600,6 +600,7 @@ def _consume_codex_event_stream(
     model: str,
     on_text_delta=None,
     on_reasoning_delta=None,
+    on_commentary=None,
     on_first_delta=None,
     on_event=None,
     interrupt_check=None,
@@ -632,6 +633,9 @@ def _consume_codex_event_stream(
       once a function_call event is seen (so tool-call turns don't bleed text
       into the chat).
     * ``on_reasoning_delta(str)`` — fires per ``response.reasoning.*.delta``.
+    * ``on_commentary(str)`` — fires once for each complete Codex
+      ``message.phase=commentary`` segment. Commentary is user-facing progress,
+      not hidden reasoning and not final-answer text.
     * ``on_first_delta()`` — one-shot, fires on the first text delta only.
     * ``on_event(event)`` — fires for every event before any other processing.
       Used for watchdog activity, debug logging, anything wire-shape-agnostic.
@@ -642,12 +646,24 @@ def _consume_codex_event_stream(
     has_tool_calls = False
     first_delta_fired = False
     active_message_phase: str | None = None
+    active_commentary_parts: list[str] = []
     terminal_status: str = "completed"
     terminal_usage: Any = None
     terminal_response_id: str = None
     terminal_incomplete_details: Any = None
     terminal_error: Any = None
     saw_terminal = False
+
+    def _flush_commentary() -> None:
+        if not active_commentary_parts:
+            return
+        text = "".join(active_commentary_parts).strip()
+        active_commentary_parts.clear()
+        if text and on_commentary is not None:
+            try:
+                on_commentary(text)
+            except Exception:
+                logger.debug("Codex stream on_commentary raised", exc_info=True)
 
     for event in event_iter:
         if on_event is not None:
@@ -676,11 +692,13 @@ def _consume_codex_event_stream(
             _raise_stream_error(event)
 
         # Track the phase of the active streamed message item.  Codex/Harmony
-        # ``commentary``/``analysis`` text is mid-turn preamble/progress
-        # narration, never the final answer.  We still collect completed output
-        # items for replay, but route those deltas to the reasoning callback so
-        # they display like thinking text instead of assistant content.
+        # ``commentary``/``analysis`` text is user-facing mid-turn progress,
+        # never the final answer or hidden reasoning. Buffer a complete segment
+        # so chat gateways receive one stable interim message rather than a
+        # separate message for every token delta.
         if event_type == "response.output_item.added":
+            if active_message_phase in {"commentary", "analysis"}:
+                _flush_commentary()
             item = _event_field(event, "item")
             item_type = _item_field(item, "type", "")
             if item_type == "message":
@@ -696,13 +714,7 @@ def _consume_codex_event_stream(
             delta_text = _event_field(event, "delta", "")
             is_commentary_delta = active_message_phase in {"commentary", "analysis"}
             if delta_text and is_commentary_delta:
-                # Commentary streams through the reasoning channel, not the
-                # visible answer stream (and stays out of output_text).
-                if on_reasoning_delta is not None:
-                    try:
-                        on_reasoning_delta(delta_text)
-                    except Exception:
-                        logger.debug("Codex stream on_reasoning_delta raised", exc_info=True)
+                active_commentary_parts.append(delta_text)
             elif delta_text:
                 collected_text_deltas.append(delta_text)
                 if not has_tool_calls:
@@ -734,12 +746,15 @@ def _consume_codex_event_stream(
             continue
 
         if event_type == "response.output_item.done":
+            if active_message_phase in {"commentary", "analysis"}:
+                _flush_commentary()
             done_item = _event_field(event, "item")
             if done_item is not None:
                 collected_output_items.append(done_item)
             continue
 
         if event_type in _TERMINAL_EVENT_TYPES:
+            _flush_commentary()
             saw_terminal = True
             resp_obj = _event_field(event, "response")
             if resp_obj is not None:
@@ -799,6 +814,7 @@ def _consume_codex_event_stream(
             "Codex Responses stream did not emit a terminal response"
         )
 
+    _flush_commentary()
     assembled_text = "".join(collected_text_deltas)
 
     final = SimpleNamespace(

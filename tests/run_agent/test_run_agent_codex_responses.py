@@ -629,7 +629,7 @@ def test_run_codex_stream_returns_collected_items_when_stream_ends_without_termi
     assert response.output == [output_item]
 
 
-def test_consume_codex_stream_routes_commentary_phase_deltas_to_reasoning(monkeypatch):
+def test_consume_codex_stream_routes_commentary_phase_to_visible_callback(monkeypatch):
     from agent.codex_runtime import _consume_codex_event_stream
 
     commentary_item = SimpleNamespace(
@@ -647,6 +647,7 @@ def test_consume_codex_stream_routes_commentary_phase_deltas_to_reasoning(monkey
     )
     streamed = []
     reasoning_streamed = []
+    commentary_streamed = []
 
     response = _consume_codex_event_stream(
         _FakeCreateStream([
@@ -667,10 +668,12 @@ def test_consume_codex_stream_routes_commentary_phase_deltas_to_reasoning(monkey
         model="gpt-5-codex",
         on_text_delta=streamed.append,
         on_reasoning_delta=reasoning_streamed.append,
+        on_commentary=commentary_streamed.append,
     )
 
     assert streamed == []
-    assert reasoning_streamed == ["I’ll call the tool now."]
+    assert reasoning_streamed == []
+    assert commentary_streamed == ["I’ll call the tool now."]
     assert response.output == [commentary_item, function_item]
     assert response.output_text == ""
 
@@ -1638,7 +1641,7 @@ def test_normalize_codex_response_marks_commentary_only_message_as_incomplete(mo
 
     assert finish_reason == "incomplete"
     assert (assistant_message.content or "") == ""
-    assert "inspect the repository" in (assistant_message.reasoning or "")
+    assert assistant_message.reasoning is None
     assert assistant_message.codex_message_items
     assert assistant_message.codex_message_items[0]["phase"] == "commentary"
     assert "inspect the repository" in assistant_message.codex_message_items[0]["content"][0]["text"]
@@ -1655,7 +1658,7 @@ def test_normalize_codex_response_does_not_fallback_to_output_text_for_commentar
 
     assert finish_reason == "incomplete"
     assert (assistant_message.content or "") == ""
-    assert "call the tool" in (assistant_message.reasoning or "")
+    assert assistant_message.reasoning is None
     assert assistant_message.codex_message_items[0]["phase"] == "commentary"
 
 def test_normalize_codex_response_final_answer_overrides_top_level_incomplete(monkeypatch):
@@ -1891,6 +1894,30 @@ def test_interim_commentary_is_not_marked_already_streamed_without_callbacks(mon
 
     assert observed == {
         "text": "short version: yes",
+        "already_streamed": False,
+    }
+
+
+def test_interim_commentary_uses_codex_message_items_when_content_is_empty(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    observed = {}
+    agent.interim_assistant_callback = lambda text, *, already_streamed=False: observed.update(
+        {"text": text, "already_streamed": already_streamed}
+    )
+
+    agent._emit_interim_assistant_message({
+        "role": "assistant",
+        "content": "",
+        "codex_message_items": [{
+            "type": "message",
+            "role": "assistant",
+            "phase": "commentary",
+            "content": [{"type": "output_text", "text": "先检查工作区状态。"}],
+        }],
+    })
+
+    assert observed == {
+        "text": "先检查工作区状态。",
         "already_streamed": False,
     }
 

@@ -1176,16 +1176,15 @@ def _normalize_codex_response(
                     saw_final_answer_phase = True
             message_text = _extract_responses_message_text(item)
             if message_text:
-                # Responses ``commentary``/``analysis`` phase text is mid-turn
-                # preamble/progress narration, never the turn's final answer
-                # (Codex CLI excludes it from last-message extraction; issues
-                # #24933 / #41293).  Keep it out of assistant content so it
-                # can't be concatenated into — or leak as — the final response,
-                # but surface it through the reasoning channel so the CLI/
-                # gateway display it like thinking text.  The exact message
-                # item is still preserved below for replay/cache continuity.
+                # Responses ``commentary``/``analysis`` phase text is
+                # user-facing mid-turn progress, never final-answer content or
+                # hidden reasoning. The agent's interim-message emitter reads
+                # it from the normalized message items after the response is
+                # complete. Keep it out of both content and reasoning here
+                # while preserving the exact item below for replay/cache
+                # continuity.
                 if is_commentary_phase:
-                    reasoning_parts.append(message_text)
+                    pass
                 else:
                     content_parts.append(message_text)
                 raw_message_item: Dict[str, Any] = {

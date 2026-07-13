@@ -4669,6 +4669,18 @@ class AIAgent:
             return
         content = assistant_msg.get("content")
         visible = self._strip_think_blocks(content or "").strip()
+        if not visible:
+            commentary_parts = []
+            for item in assistant_msg.get("codex_message_items") or []:
+                if not isinstance(item, dict) or item.get("phase") not in {"commentary", "analysis"}:
+                    continue
+                for part in item.get("content") or []:
+                    if not isinstance(part, dict) or part.get("type") not in {"text", "output_text"}:
+                        continue
+                    text = part.get("text")
+                    if isinstance(text, str) and text.strip():
+                        commentary_parts.append(text.strip())
+            visible = self._strip_think_blocks("\n\n".join(commentary_parts)).strip()
         if not visible or visible == "(empty)":
             return
         already_streamed = self._interim_content_was_streamed(visible)
