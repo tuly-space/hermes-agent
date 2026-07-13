@@ -845,6 +845,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     max_stream_retries = 1
     # Accumulate streamed text so callers / compat shims can read it.
     agent._codex_streamed_text_parts: list = []
+    agent._codex_emitted_commentary_keys = set()
 
     def _on_text_delta(text: str) -> None:
         agent._codex_streamed_text_parts.append(text)
@@ -852,6 +853,12 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
 
     def _on_reasoning_delta(text: str) -> None:
         agent._fire_reasoning_delta(text)
+
+    def _on_commentary(text: str) -> None:
+        agent._emit_interim_assistant_message({
+            "role": "assistant",
+            "content": text,
+        })
 
     def _on_event(event: Any) -> None:
         # TTFB watchdog and activity touch — runs once per SSE event.
@@ -892,6 +899,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     model=api_kwargs.get("model"),
                     on_text_delta=_on_text_delta,
                     on_reasoning_delta=_on_reasoning_delta,
+                    on_commentary=_on_commentary,
                     on_first_delta=on_first_delta,
                     on_event=_on_event,
                     interrupt_check=_interrupt_check,

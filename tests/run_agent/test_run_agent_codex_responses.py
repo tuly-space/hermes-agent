@@ -678,6 +678,59 @@ def test_consume_codex_stream_routes_commentary_phase_to_visible_callback(monkey
     assert response.output_text == ""
 
 
+def test_run_codex_stream_emits_commentary_once_through_real_callback_chain(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    observed = []
+    agent.interim_assistant_callback = lambda text, *, already_streamed=False: observed.append(
+        (text, already_streamed)
+    )
+    commentary_item = SimpleNamespace(
+        type="message",
+        phase="commentary",
+        status="completed",
+        content=[SimpleNamespace(type="output_text", text="I’ll inspect the repository now.")],
+    )
+
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(create=lambda **kwargs: _FakeCreateStream([
+            SimpleNamespace(type="response.created"),
+            SimpleNamespace(
+                type="response.output_item.added",
+                item=SimpleNamespace(type="message", phase="commentary"),
+            ),
+            SimpleNamespace(
+                type="response.output_text.delta",
+                delta="I’ll inspect the repository now.",
+            ),
+            SimpleNamespace(type="response.output_item.done", item=commentary_item),
+            SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(status="completed"),
+            ),
+        ])),
+    )
+
+    response = agent._run_codex_stream(_codex_request_kwargs())
+    assert observed == [("I’ll inspect the repository now.", False)]
+
+    agent._emit_interim_assistant_message({
+        "role": "assistant",
+        "content": "",
+        "codex_message_items": [{
+            "type": "message",
+            "role": "assistant",
+            "phase": "commentary",
+            "content": [{
+                "type": "output_text",
+                "text": "I’ll inspect the repository now.",
+            }],
+        }],
+    })
+
+    assert response.output == [commentary_item]
+    assert observed == [("I’ll inspect the repository now.", False)]
+
+
 def test_consume_codex_stream_keeps_final_answer_phase_deltas(monkeypatch):
     from agent.codex_runtime import _consume_codex_event_stream
 

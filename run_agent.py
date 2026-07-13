@@ -4683,9 +4683,15 @@ class AIAgent:
             visible = self._strip_think_blocks("\n\n".join(commentary_parts)).strip()
         if not visible or visible == "(empty)":
             return
+        commentary_key = self._normalize_interim_visible_text(visible)
+        emitted_commentary = getattr(self, "_codex_emitted_commentary_keys", None)
+        if emitted_commentary is not None and commentary_key in emitted_commentary:
+            return
         already_streamed = self._interim_content_was_streamed(visible)
         try:
             cb(visible, already_streamed=already_streamed)
+            if emitted_commentary is not None and commentary_key:
+                emitted_commentary.add(commentary_key)
         except Exception:
             logger.debug("interim_assistant_callback error", exc_info=True)
 
