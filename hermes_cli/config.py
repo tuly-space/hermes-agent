@@ -3123,6 +3123,16 @@ DEFAULT_CONFIG = {
         # ``"off"`` — alias for ``manual``.
         "install_strategy": "auto",
 
+        # Optional bounded lifecycle for long-running, multi-workspace
+        # processes. Disabled by default to preserve process-lifetime client
+        # retention unless the user explicitly opts in.
+        "lifecycle": {
+            "enabled": False,
+            "idle_timeout_seconds": 7200,
+            "sweep_interval_seconds": 60,
+            "max_clients_per_process": 0,
+        },
+
         # Per-server overrides.  Each key is a server_id from the
         # registry (``pyright``, ``typescript``, ``gopls``,
         # ``rust-analyzer``, etc.) and accepts:

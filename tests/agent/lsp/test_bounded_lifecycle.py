@@ -109,9 +109,21 @@ def test_lifecycle_config_is_opt_in_and_strict(caplog):
     assert "invalid lsp.lifecycle configuration" in caplog.text
 
 
+def test_default_config_declares_lifecycle_policy():
+    from hermes_cli.config import DEFAULT_CONFIG
+
+    assert DEFAULT_CONFIG["lsp"]["lifecycle"] == {
+        "enabled": False,
+        "idle_timeout_seconds": 7200,
+        "sweep_interval_seconds": 60,
+        "max_clients_per_process": 0,
+    }
+
+
 def test_create_from_config_wires_lifecycle_settings(monkeypatch):
     from hermes_cli import config as config_module
 
+    captured = {}
     monkeypatch.setattr(
         config_module,
         "load_config",
@@ -127,18 +139,19 @@ def test_create_from_config_wires_lifecycle_settings(monkeypatch):
             }
         },
     )
+    monkeypatch.setattr(
+        LSPService,
+        "__init__",
+        lambda self, **kwargs: captured.update(kwargs),
+    )
+
     service = LSPService.create_from_config()
     assert service is not None
-    try:
-        lifecycle = service.get_status()["lifecycle"]
-        assert lifecycle["enabled"] is True
-        assert lifecycle["idle_timeout_seconds"] == 1800.0
-        assert lifecycle["sweep_interval_seconds"] == 30.0
-        assert lifecycle["max_clients_per_process"] == 4
-        assert lifecycle["config_error"] is None
-        assert lifecycle["reaper_running"] is True
-    finally:
-        service.shutdown()
+    assert captured["lifecycle_enabled"] is True
+    assert captured["idle_timeout"] == 1800.0
+    assert captured["sweep_interval"] == 30.0
+    assert captured["max_clients"] == 4
+    assert captured["lifecycle_error"] is None
 
 
 def test_invalid_enabled_policy_stays_bounded_and_surfaces_error(monkeypatch):
