@@ -1401,9 +1401,55 @@ def _is_channel_dm_topic(
     return is_channel
 
 
-def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
+CRON_MESSAGE_BREAK_MARKER = "[CRON_MESSAGE_BREAK]"
+
+
+def _split_cron_delivery_messages(content: str) -> List[str]:
+    """Split an explicitly multi-message cron response into non-empty parts.
+
+    The marker must occupy its own line. Ordinary output, including inline
+    mentions of the marker, is preserved byte-for-byte for backward
+    compatibility with existing cron jobs.
     """
-    Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
+    lines = content.splitlines()
+    if not any(line.strip() == CRON_MESSAGE_BREAK_MARKER for line in lines):
+        return [content]
+
+    parts: List[str] = []
+    current: List[str] = []
+    for line in lines:
+        if line.strip() == CRON_MESSAGE_BREAK_MARKER:
+            part = "\n".join(current).strip()
+            if part:
+                parts.append(part)
+            current = []
+            continue
+        current.append(line)
+
+    part = "\n".join(current).strip()
+    if part:
+        parts.append(part)
+    return parts
+
+
+def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
+    """Deliver one cron result, optionally as multiple explicit messages."""
+    errors = []
+    for index, message in enumerate(_split_cron_delivery_messages(content), start=1):
+        error = _deliver_single_result(
+            job,
+            message,
+            adapters=adapters,
+            loop=loop,
+        )
+        if error:
+            errors.append(f"message {index}: {error}")
+    return "; ".join(errors) if errors else None
+
+
+def _deliver_single_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
+    """
+    Deliver one job output message to the configured target(s).
 
     When ``adapters`` and ``loop`` are provided (gateway is running), tries to
     use the live adapter first — this supports E2EE rooms (e.g. Matrix) where
