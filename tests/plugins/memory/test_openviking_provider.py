@@ -1593,6 +1593,98 @@ def test_tool_add_resource_sends_git_remote_sources_as_path(url):
     })
 
 
+def test_tool_remember_defaults_freeform_content_to_pattern_and_returns_uri():
+    provider = OpenVikingMemoryProvider()
+    provider._client = MagicMock()
+    provider._agent = "hermes"
+    provider._client.post.return_value = {"result": {"written_bytes": 42}}
+
+    result = json.loads(provider._tool_remember({"content": "generic durable pattern"}))
+
+    payload = provider._client.post.call_args.args[1]
+    assert payload["uri"].startswith(
+        "viking://user/peers/hermes/memories/patterns/mem_"
+    )
+    assert payload["mode"] == "create"
+    assert payload["content"].startswith("generic durable pattern\n\n<!-- MEMORY_FIELDS\n")
+    assert '"memory_type": "patterns"' in payload["content"]
+    assert result["status"] == "stored"
+    assert result["category"] == "pattern"
+    assert result["uri"] == payload["uri"]
+
+
+@pytest.mark.parametrize(
+    ("category", "metadata", "missing"),
+    [
+        ("preference", {}, "topic"),
+        ("entity", {"category": "service"}, "name"),
+        ("event", {"event_name": "gateway restart"}, "goal"),
+        (
+            "case",
+            {"case_name": "storage migration", "task_signature": "migrate state db"},
+            "input, rubric",
+        ),
+    ],
+)
+def test_tool_remember_rejects_structured_category_without_required_metadata(
+    category, metadata, missing
+):
+    provider = OpenVikingMemoryProvider()
+    provider._client = MagicMock()
+
+    result = json.loads(provider._tool_remember({
+        "content": "structured memory",
+        "category": category,
+        "metadata": metadata,
+    }))
+
+    assert missing in result["error"]
+    provider._client.post.assert_not_called()
+
+
+def test_tool_remember_serializes_event_metadata_for_native_embedding():
+    provider = OpenVikingMemoryProvider()
+    provider._client = MagicMock()
+    provider._agent = "hermes"
+    provider._client.post.return_value = {"result": {"written_bytes": 128}}
+
+    result = json.loads(provider._tool_remember({
+        "content": "Hermes completed an OpenViking write-path check.",
+        "category": "event",
+        "metadata": {
+            "event_name": "openviking_write_verified",
+            "goal": "verify structured memory",
+        },
+    }))
+
+    payload = provider._client.post.call_args.args[1]
+    assert payload["uri"].startswith(
+        "viking://user/peers/hermes/memories/events/mem_"
+    )
+    assert '"event_name": "openviking_write_verified"' in payload["content"]
+    assert '"goal": "verify structured memory"' in payload["content"]
+    assert '"memory_type": "events"' in payload["content"]
+    assert result["uri"] == payload["uri"]
+    assert result["category"] == "event"
+
+
+def test_tool_remember_fills_preference_user_from_active_tenant():
+    provider = OpenVikingMemoryProvider()
+    provider._client = MagicMock()
+    provider._client.post.return_value = {"result": {"written_bytes": 64}}
+    provider._user = "jamie"
+
+    provider._tool_remember({
+        "content": "Jamie prefers concise replies.",
+        "category": "preference",
+        "metadata": {"topic": "reply style"},
+    })
+
+    payload = provider._client.post.call_args.args[1]
+    assert '"user": "jamie"' in payload["content"]
+    assert '"topic": "reply style"' in payload["content"]
+
+
 def test_get_tool_schemas_omits_profile_and_keeps_narrow_forget_tools():
     provider = OpenVikingMemoryProvider()
 
@@ -3545,7 +3637,12 @@ def test_on_memory_write_uses_content_write_independent_of_session_rotation():
         _mod._VikingClient = real_client_cls
 
     assert captured_paths == ["/api/v1/content/write"]
-    assert captured_payloads[0]["content"] == "remember this"
+    assert captured_payloads[0]["content"].startswith(
+        "remember this\n\n<!-- MEMORY_FIELDS\n"
+    )
+    assert '"user": "usr"' in captured_payloads[0]["content"]
+    assert '"topic": "remember this"' in captured_payloads[0]["content"]
+    assert '"memory_type": "preferences"' in captured_payloads[0]["content"]
     assert captured_payloads[0]["mode"] == "create"
     assert captured_payloads[0]["uri"].startswith(
         "viking://user/peers/hermes/memories/preferences/mem_"
