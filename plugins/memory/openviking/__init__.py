@@ -150,7 +150,32 @@ _CATEGORY_SUBDIR_MAP = {
     "case": "cases",
     "pattern": "patterns",
 }
-_DEFAULT_MEMORY_SUBDIR = "preferences"
+_DEFAULT_MEMORY_SUBDIR = "patterns"
+
+# OpenViking memory directories with embedding templates require these
+# structured MEMORY_FIELDS.  Direct content/write calls bypass OpenViking's
+# session extraction, so the Hermes tool must either supply the fields or
+# reject the write instead of silently forcing plain-content embeddings.
+_CATEGORY_REQUIRED_METADATA = {
+    "preference": ("topic",),  # ``user`` is filled from the active tenant.
+    "entity": ("category", "name"),
+    "event": ("event_name", "goal"),
+    "case": ("case_name", "task_signature", "input", "rubric"),
+    "pattern": (),
+}
+
+
+def _serialize_memory_fields(content: str, memory_type: str, metadata: dict) -> str:
+    """Serialize direct writes in OpenViking's native MEMORY_FIELDS format."""
+    clean_metadata = {
+        str(key): value
+        for key, value in metadata.items()
+        if value is not None and (not isinstance(value, str) or value.strip())
+    }
+    clean_metadata.setdefault("version", 1)
+    clean_metadata["memory_type"] = memory_type
+    metadata_json = json.dumps(clean_metadata, indent=2, ensure_ascii=False)
+    return f"{content.rstrip()}\n\n<!-- MEMORY_FIELDS\n{metadata_json}\n-->"
 
 # Maps the built-in memory tool's `target` ("user" vs "memory") to a subdir
 # for on_memory_write mirroring. User profile facts → preferences; agent
@@ -628,7 +653,8 @@ REMEMBER_SCHEMA = {
     "description": (
         "Explicitly store a fact or memory in the OpenViking knowledge base. "
         "Use for important information the agent should remember long-term. "
-        "The system automatically categorizes and indexes the memory."
+        "Generic free-form memories default to pattern. Structured categories "
+        "require category-specific metadata so OpenViking can build its native embedding."
     ),
     "parameters": {
         "type": "object",
@@ -637,7 +663,28 @@ REMEMBER_SCHEMA = {
             "category": {
                 "type": "string",
                 "enum": ["preference", "entity", "event", "case", "pattern"],
-                "description": "Memory category (default: auto-detected).",
+                "description": "Memory category (default: pattern).",
+            },
+            "metadata": {
+                "type": "object",
+                "description": (
+                    "Structured OpenViking fields. preference requires topic; "
+                    "entity requires category and name; event requires event_name and goal; "
+                    "case requires case_name, task_signature, input, and rubric."
+                ),
+                "properties": {
+                    "topic": {"type": "string"},
+                    "user": {"type": "string"},
+                    "category": {"type": "string"},
+                    "name": {"type": "string"},
+                    "event_name": {"type": "string"},
+                    "goal": {"type": "string"},
+                    "case_name": {"type": "string"},
+                    "task_signature": {"type": "string"},
+                    "input": {"type": "string"},
+                    "rubric": {"type": "string"},
+                },
+                "additionalProperties": True,
             },
         },
         "required": ["content"],
@@ -4918,6 +4965,17 @@ class OpenVikingMemoryProvider(MemoryProvider):
         except Exception as e:
             logger.debug("OpenViking memory mirror client creation failed: %s", e)
             return
+        mirror_metadata: Dict[str, Any] = {}
+        if subdir == "preferences":
+            # Built-in user-memory writes do not carry OpenViking's preference
+            # fields. Add deterministic tenant/topic metadata rather than
+            # forcing the server to fall back to a plain-content embedding.
+            first_line = next((line.strip() for line in content.splitlines() if line.strip()), content)
+            mirror_metadata = {
+                "user": self._user or "user",
+                "topic": first_line[:160],
+            }
+        serialized_content = _serialize_memory_fields(content, subdir, mirror_metadata)
 
         def _write():
             try:
@@ -4926,7 +4984,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 )
                 client.post("/api/v1/content/write", {
                     "uri": uri,
-                    "content": content,
+                    "content": serialized_content,
                     "mode": "create",
                 })
             except Exception as e:
@@ -5291,12 +5349,31 @@ class OpenVikingMemoryProvider(MemoryProvider):
         if not content:
             return tool_error("content is required")
 
-        category = args.get("category", "")
+        category = args.get("category") or "pattern"
         subdir = _CATEGORY_SUBDIR_MAP.get(category, _DEFAULT_MEMORY_SUBDIR)
+        metadata = args.get("metadata") or {}
+        if not isinstance(metadata, dict):
+            return tool_error("metadata must be an object")
+
+        metadata = dict(metadata)
+        if category == "preference":
+            metadata.setdefault("user", self._user or "user")
+        required = _CATEGORY_REQUIRED_METADATA.get(category, ())
+        missing = [
+            field
+            for field in required
+            if not isinstance(metadata.get(field), str) or not metadata[field].strip()
+        ]
+        if missing:
+            return tool_error(
+                f"category '{category}' requires metadata fields: {', '.join(missing)}"
+            )
+
         client = self._ensure_client()
         if not client:
             return tool_error("OpenViking server not connected")
         uri = self._build_memory_uri(subdir, client=client)
+        serialized_content = _serialize_memory_fields(content, subdir, metadata)
 
         # Write directly via content/write API.
         # This creates the file, stores the content, and queues vector indexing
@@ -5304,13 +5381,15 @@ class OpenVikingMemoryProvider(MemoryProvider):
         try:
             result = client.post("/api/v1/content/write", {
                 "uri": uri,
-                "content": content,
+                "content": serialized_content,
                 "mode": "create",
             })
             written = result.get("result", {}).get("written_bytes", 0)
             return json.dumps({
                 "status": "stored",
                 "message": f"Memory stored ({written}b) and queued for vector indexing.",
+                "uri": uri,
+                "category": category,
             })
         except Exception as e:
             logger.error("OpenViking content/write failed: %s", e)
