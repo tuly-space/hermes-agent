@@ -176,6 +176,12 @@ class TestGenerate:
             "n": 1,
         }
         assert captured["headers"]["Authorization"] == "Bearer secret-key"
+        user_agent = captured["headers"]["User-Agent"]
+        assert user_agent.startswith("Mozilla/5.0 ")
+        assert "Chrome/" in user_agent
+        assert "python" not in user_agent.lower()
+        assert "httpx" not in user_agent.lower()
+        assert captured["headers"]["Accept"] == "application/json"
 
         # Saved file
         saved = Path(result["image"])
