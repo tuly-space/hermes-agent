@@ -91,6 +91,15 @@ _SIZES = {
 
 DEFAULT_BASE_URL = "http://127.0.0.1:8088/v1"
 
+# The Cloudflare-fronted shared proxy rejects Python-library user agents on
+# this route.  Keep this provider's wire identity browser-like rather than
+# inheriting httpx's default ``python-httpx/*`` value.
+_BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/138.0.0.0 Safari/537.36"
+)
+
 # Generous timeout — gpt-image-2 high quality can take ~2min, and the proxy
 # adds OAuth refresh / upstream latency on top.
 _REQUEST_TIMEOUT = 300.0
@@ -295,7 +304,11 @@ class CodexImageProxyImageGenProvider(ImageGenProvider):
             "quality": meta["quality"],
             "n": 1,
         }
-        headers = {"Content-Type": "application/json"}
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": _BROWSER_USER_AGENT,
+        }
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
 
