@@ -960,7 +960,9 @@ class TestEnsureClientReloadsEnv:
         assert out["status"] == "stored"
         assert len(instances) == 2
         assert instances[1].posts[0][0] == "/api/v1/content/write"
-        assert instances[1].posts[0][1]["content"] == "stable fact"
+        content = instances[1].posts[0][1]["content"]
+        assert content.startswith("stable fact\n\n<!-- MEMORY_FIELDS\n")
+        assert '"memory_type": "patterns"' in content
         assert instances[1].posts[0][1]["mode"] == "create"
         assert instances[1].posts[0][1]["uri"].startswith(
             "viking://user/default/peers/hermes/memories/"
