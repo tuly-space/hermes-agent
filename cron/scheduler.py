@@ -1905,6 +1905,26 @@ def _is_channel_dm_topic(
 
 
 CRON_MESSAGE_BREAK_MARKER = "[CRON_MESSAGE_BREAK]"
+CRON_MESSAGE_TITLE_MARKER = "[CRON_MESSAGE_TITLE]"
+
+
+def _extract_cron_delivery_title(content: str) -> tuple[Optional[str], str]:
+    """Extract an optional per-message title from the first non-empty line.
+
+    The marker is removed before visible delivery and session mirroring. Outputs
+    without the marker retain their existing behavior.
+    """
+    lines = content.splitlines()
+    for index, line in enumerate(lines):
+        if not line.strip():
+            continue
+        stripped = line.strip()
+        if not stripped.startswith(CRON_MESSAGE_TITLE_MARKER):
+            return None, content
+        title = stripped[len(CRON_MESSAGE_TITLE_MARKER):].strip()
+        body = "\n".join(lines[:index] + lines[index + 1:]).strip()
+        return (title or None), body
+    return None, content
 
 
 def _split_cron_delivery_messages(content: str) -> List[str]:
@@ -1939,18 +1959,25 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     """Deliver one cron result, optionally as multiple explicit messages."""
     errors = []
     for index, message in enumerate(_split_cron_delivery_messages(content), start=1):
-        error = _deliver_single_result(
-            job,
-            message,
-            adapters=adapters,
-            loop=loop,
-        )
+        message_title, message_body = _extract_cron_delivery_title(message)
+        if not message_body:
+            continue
+        kwargs = {"adapters": adapters, "loop": loop}
+        if message_title:
+            kwargs["message_title"] = message_title
+        error = _deliver_single_result(job, message_body, **kwargs)
         if error:
             errors.append(f"message {index}: {error}")
     return "; ".join(errors) if errors else None
 
 
-def _deliver_single_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
+def _deliver_single_result(
+    job: dict,
+    content: str,
+    adapters=None,
+    loop=None,
+    message_title: Optional[str] = None,
+) -> Optional[str]:
     """
     Deliver one job output message to the configured target(s).
 
@@ -2287,6 +2314,9 @@ def _deliver_single_result(job: dict, content: str, adapters=None, loop=None) ->
                 if route_thread_id:
                     route_metadata["thread_id"] = route_thread_id
                 media_metadata = {"thread_id": thread_id} if thread_id else None
+
+            if message_title and platform_name.lower() == "discord":
+                route_metadata["forum_post_title"] = message_title
 
             try:
                 # Send cleaned text (MEDIA tags stripped) — not the raw content.

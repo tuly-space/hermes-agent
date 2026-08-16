@@ -3463,7 +3463,11 @@ class DiscordAdapter(BasePlatformAdapter):
 
             # Forum channels reject channel.send() — create a thread post instead.
             if self._is_forum_parent(channel):
-                result = await self._send_to_forum(channel, content)
+                result = await self._send_to_forum(
+                    channel,
+                    content,
+                    thread_name=(metadata or {}).get("forum_post_title"),
+                )
                 await asyncio.to_thread(
                     self._record_discord_response,
                     reply_to=reply_to,
@@ -3552,7 +3556,13 @@ class DiscordAdapter(BasePlatformAdapter):
             )
             return result
 
-    async def _send_to_forum(self, forum_channel: Any, content: str) -> SendResult:
+    async def _send_to_forum(
+        self,
+        forum_channel: Any,
+        content: str,
+        *,
+        thread_name: Optional[str] = None,
+    ) -> SendResult:
         """Create a thread post in a forum channel with the message as starter content.
 
         Forum channels (type 15) don't support direct messages.  Instead we
@@ -3567,7 +3577,7 @@ class DiscordAdapter(BasePlatformAdapter):
         formatted = self.format_message(content)
         chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
 
-        thread_name = _derive_forum_thread_name(content)
+        thread_name = _derive_forum_thread_name(thread_name or content)
 
         starter_content = chunks[0] if chunks else thread_name
 
@@ -3598,7 +3608,11 @@ class DiscordAdapter(BasePlatformAdapter):
                 logger.warning("[%s] %s", self.name, warning)
                 warnings.append(warning)
 
-        raw_response: Dict[str, Any] = {"message_ids": message_ids, "thread_id": thread_id}
+        raw_response: Dict[str, Any] = {
+            "message_ids": message_ids,
+            "thread_id": thread_id,
+            "thread_name": thread_name,
+        }
         if warnings:
             raw_response["warnings"] = warnings
 

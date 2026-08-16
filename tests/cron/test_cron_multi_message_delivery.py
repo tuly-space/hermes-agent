@@ -81,6 +81,36 @@ def test_deliver_result_aggregates_part_errors_and_continues(monkeypatch):
     assert error == "message 1: network down"
 
 
+def test_deliver_result_extracts_per_message_forum_titles(monkeypatch):
+    calls = []
+
+    def fake_deliver_single(
+        job, content, adapters=None, loop=None, message_title=None
+    ):
+        calls.append((content, message_title))
+        return None
+
+    monkeypatch.setattr(scheduler, "_deliver_single_result", fake_deliver_single)
+
+    content = (
+        "[CRON_MESSAGE_TITLE] Downloaded video is missing\n"
+        "Feedback report one\n"
+        "[CRON_MESSAGE_BREAK]\n"
+        "[CRON_MESSAGE_TITLE] Subscription cancellation help\n"
+        "Feedback report two"
+    )
+    assert scheduler._deliver_result({"id": "job-1"}, content) is None
+    assert calls == [
+        ("Feedback report one", "Downloaded video is missing"),
+        ("Feedback report two", "Subscription cancellation help"),
+    ]
+
+
+def test_extract_cron_delivery_title_preserves_unmarked_content():
+    content = "Feedback report\n[CRON_MESSAGE_TITLE] literal later line"
+    assert scheduler._extract_cron_delivery_title(content) == (None, content)
+
+
 def test_single_explicit_discord_target_requires_per_job_opt_in():
     targets = [{"platform": "discord", "chat_id": "1510950505835270144"}]
 
