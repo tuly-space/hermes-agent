@@ -429,10 +429,13 @@ Behaviour is **thread-preferred**, scoped to the job's origin chat:
   is mirrored into the origin DM session instead — the DM itself is the
   continuation surface.
 
-Only the origin chat is ever touched: fan-out / broadcast targets (`all`,
-explicit other-chat deliveries) are never made continuable. The mirror is
-written as a labelled user turn (`[Cron delivery: <task name>]`), which keeps
-the conversation history alternation-safe across all model providers.
+The origin chat is the normal continuation target. Fan-out / broadcast targets
+(`all`, comma-separated destinations) are never made continuable. One narrow
+explicit-target exception is supported: when a job targets exactly one Discord
+forum and opts into `attach_to_session`, every delivered forum post receives an
+independent seeded session. The mirror is written as a labelled user turn
+(`[Cron delivery: <task name>]`), which keeps conversation history
+alternation-safe across all model providers.
 
 #### Flat, in-channel continuation (Slack)
 

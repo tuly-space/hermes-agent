@@ -956,6 +956,22 @@ def _target_matches_origin(origin: dict, platform_name: str, chat_id: str,
     return True
 
 
+def _single_explicit_discord_target(job: dict, targets: List[dict]) -> bool:
+    """Whether this run targets exactly one explicit Discord destination.
+
+    Continuable cron normally remains origin-scoped. The narrow exception is
+    an explicitly selected Discord forum: Discord creates a fresh post/thread
+    during delivery, and the returned thread id gives us an unambiguous,
+    isolated continuation surface. Broadcasts and ``all`` remain excluded.
+    """
+    if job.get("attach_to_session") is not True or len(targets) != 1:
+        return False
+    deliver_value = _normalize_deliver_value(job.get("deliver", "local")).strip()
+    if "," in deliver_value:
+        return False
+    return deliver_value.lower().startswith("discord:")
+
+
 def _maybe_mirror_cron_delivery(
     job: dict,
     platform_name: str,
@@ -1148,6 +1164,41 @@ def _seed_cron_thread_session(
             "Job '%s': seeding cron thread session failed for %s:%s:%s: %s",
             job.get("id", "?"), platform_name, chat_id, thread_id, e,
         )
+
+
+def _seed_explicit_discord_forum_session(
+    job: dict,
+    adapter,
+    platform_name: str,
+    chat_id: str,
+    send_raw_response: Any,
+    mirror_text: str,
+    *,
+    enabled: bool,
+) -> bool:
+    """Seed the session for a newly-created explicit Discord forum post.
+
+    ``DiscordAdapter._send_to_forum`` returns the created post's ``thread_id``.
+    For a per-job continuable cron with one explicit Discord target, use that
+    id to create the exact session the first human reply will resolve to. A
+    normal channel send has no returned ``thread_id`` and remains unchanged.
+    """
+    if not enabled or str(platform_name).lower() != "discord":
+        return False
+    if not isinstance(send_raw_response, dict):
+        return False
+    forum_thread_id = str(send_raw_response.get("thread_id") or "").strip()
+    if not forum_thread_id:
+        return False
+    _seed_cron_thread_session(
+        job,
+        adapter,
+        platform_name,
+        chat_id,
+        forum_thread_id,
+        mirror_text,
+    )
+    return True
 
 
 def _seed_cron_channel_session(
@@ -1919,6 +1970,8 @@ def _deliver_single_result(job: dict, content: str, adapters=None, loop=None) ->
         logger.warning("Job '%s': %s", job["id"], msg)
         return msg
 
+    explicit_discord_continuation = _single_explicit_discord_target(job, targets)
+
     from tools.send_message_tool import _send_to_platform
     from gateway.config import load_gateway_config, Platform
 
@@ -2233,6 +2286,7 @@ def _deliver_single_result(job: dict, content: str, adapters=None, loop=None) ->
                 text_to_send = cleaned_delivery_content.strip()
                 adapter_ok = True
                 timed_out = False
+                send_raw_response = None
                 if text_to_send:
                     from agent.async_utils import safe_schedule_threadsafe
 
@@ -2418,6 +2472,21 @@ def _deliver_single_result(job: dict, content: str, adapters=None, loop=None) ->
                             chat_name=origin.get("chat_name"),
                         )
                         thread_seeded = True
+                    # A direct send to a Discord forum creates the post inside
+                    # DiscordAdapter.send(), so there was no thread id available
+                    # before delivery. Use the returned id to create and seed an
+                    # isolated session for this one forum post. This is strictly
+                    # per-job opt-in and excludes fan-out/broadcast deliveries.
+                    if not thread_seeded:
+                        thread_seeded = _seed_explicit_discord_forum_session(
+                            job,
+                            runtime_adapter,
+                            platform_name,
+                            chat_id,
+                            send_raw_response,
+                            mirror_text,
+                            enabled=explicit_discord_continuation,
+                        )
                     # in_channel surface: CREATE + seed the flat channel/DM
                     # session (the shipped mirror only appends to an existing
                     # session — the flat row is otherwise absent for a

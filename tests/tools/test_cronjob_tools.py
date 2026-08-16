@@ -387,6 +387,29 @@ class TestUnifiedCronjobTool:
         stored = get_job(created["job_id"])
         assert stored["deliver"] == "telegram"
 
+    def test_registry_handler_forwards_attach_to_session(self):
+        """The agent-facing registry must persist the continuation opt-in."""
+        from cron.jobs import get_job
+        from tools.registry import registry
+
+        created = json.loads(
+            registry.dispatch(
+                "cronjob",
+                {
+                    "action": "create",
+                    "prompt": "Post a forum case",
+                    "schedule": "every 1h",
+                    "deliver": "discord:1510950505835270144",
+                    "attach_to_session": True,
+                },
+            )
+        )
+
+        assert created["success"] is True
+        stored = get_job(created["job_id"])
+        assert stored is not None
+        assert stored["attach_to_session"] is True
+
 
 # =========================================================================
 # Agent-facing surface: per-job model pins are user-owned
