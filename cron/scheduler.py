@@ -1996,7 +1996,7 @@ def _seed_cron_thread_session(
     chat_name: Optional[str] = None,
     is_dm: bool = False,
     scope_id: Optional[str] = None,
-) -> None:
+) -> bool:
     """Seed the freshly-opened cron thread's session with the brief.
 
     Without this the brief is *visible* in the new thread but absent from any
@@ -2029,48 +2029,50 @@ def _seed_cron_thread_session(
     """
     text = (mirror_text or "").strip()
     if not text:
-        return
+        return False
     try:
         from gateway.config import Platform
         from gateway.session import SessionSource
 
-        seeded_session_id: Optional[str] = None
         session_store = getattr(adapter, "_session_store", None)
-        if session_store is not None:
-            try:
-                platform_enum = Platform(platform_name.lower())
-            except (ValueError, KeyError):
-                platform_enum = None
-            if platform_enum is not None:
-                # Discord thread destinations must key on the thread's OWN id
-                # to match how the Discord adapter keys organic in-thread
-                # messages (chat_id == thread_id). Other platforms (Slack,
-                # Telegram) use chat_id == parent_channel for thread messages,
-                # so the parent chat_id is correct for them. See the matching
-                # guard in GatewayRunner._process_handoff.
-                if platform_enum == Platform.DISCORD:
-                    seed_chat_id = str(thread_id)
-                else:
-                    seed_chat_id = str(chat_id)
-                dest_source = SessionSource(
-                    platform=platform_enum,
-                    chat_id=seed_chat_id,
-                    chat_name=chat_name,
-                    # DM threads key through the DM arm (see docstring); the
-                    # reply's chat_type is what the seed must reproduce.
-                    chat_type="dm" if is_dm else "thread",
-                    user_id="system:cron",
-                    user_name="Cron",
-                    thread_id=str(thread_id),
-                    scope_id=str(scope_id) if scope_id else None,
-                )
-                # Ensure the thread-keyed session row exists so the mirror has
-                # a target and the user's later reply joins the same session.
-                # Capture the exact id — the mirror writes into THIS row, not
-                # an origin-heuristic rediscovery (which bails on populated
-                # chats; same class as the flat-seed live failure 2026-08-19).
-                _entry = session_store.get_or_create_session(dest_source)
-                seeded_session_id = getattr(_entry, "session_id", None)
+        if session_store is None:
+            return False
+        try:
+            platform_enum = Platform(platform_name.lower())
+        except (ValueError, KeyError):
+            return False
+
+        # Discord thread destinations must key on the thread's OWN id
+        # to match how the Discord adapter keys organic in-thread
+        # messages (chat_id == thread_id). Other platforms (Slack,
+        # Telegram) use chat_id == parent_channel for thread messages,
+        # so the parent chat_id is correct for them. See the matching
+        # guard in GatewayRunner._process_handoff.
+        if platform_enum == Platform.DISCORD:
+            seed_chat_id = str(thread_id)
+        else:
+            seed_chat_id = str(chat_id)
+        dest_source = SessionSource(
+            platform=platform_enum,
+            chat_id=seed_chat_id,
+            chat_name=chat_name,
+            # DM threads key through the DM arm (see docstring); the
+            # reply's chat_type is what the seed must reproduce.
+            chat_type="dm" if is_dm else "thread",
+            user_id="system:cron",
+            user_name="Cron",
+            thread_id=str(thread_id),
+            scope_id=str(scope_id) if scope_id else None,
+        )
+        # Ensure the thread-keyed session row exists so the mirror has
+        # a target and the user's later reply joins the same session.
+        # Capture the exact id — the mirror writes into THIS row, not
+        # an origin-heuristic rediscovery (which bails on populated
+        # chats; same class as the flat-seed live failure 2026-08-19).
+        entry = session_store.get_or_create_session(dest_source)
+        seeded_session_id = getattr(entry, "session_id", None)
+        if not seeded_session_id:
+            return False
 
         from gateway.mirror import mirror_to_session
 
@@ -2100,6 +2102,7 @@ def _seed_cron_thread_session(
                 "in-thread reply will not see this brief",
                 job.get("id", "?"), platform_name, chat_id, thread_id,
             )
+        return bool(ok)
     except Exception as e:
         # WARNING, not debug: a silent seed failure IS the continuation-
         # amnesia bug (Alice 2026-08-19) — it must be visible in production.
@@ -2107,6 +2110,7 @@ def _seed_cron_thread_session(
             "Job '%s': seeding cron thread session failed for %s:%s:%s: %s",
             job.get("id", "?"), platform_name, chat_id, thread_id, e,
         )
+        return False
 
 
 def _seed_explicit_discord_forum_session(
@@ -2133,7 +2137,7 @@ def _seed_explicit_discord_forum_session(
     forum_thread_id = str(send_raw_response.get("thread_id") or "").strip()
     if not forum_thread_id:
         return False
-    _seed_cron_thread_session(
+    return _seed_cron_thread_session(
         job,
         adapter,
         platform_name,
@@ -2141,7 +2145,6 @@ def _seed_explicit_discord_forum_session(
         forum_thread_id,
         mirror_text,
     )
-    return True
 
 
 def _seed_cron_channel_session(
