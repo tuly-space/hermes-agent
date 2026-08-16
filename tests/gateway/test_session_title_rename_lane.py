@@ -14,7 +14,8 @@ import types
 import pytest
 
 from gateway.config import Platform
-from gateway.run import TurnRunner
+from gateway.run import GatewayRunner, TurnRunner
+from gateway.session import SessionSource
 
 
 def _attach(lane):
@@ -53,3 +54,57 @@ def test_the_rename_waits_for_the_model_title(lane):
 
     callback("Fix flaky auth test", "llm")
     assert renames == ["Fix flaky auth test"]
+
+
+@pytest.mark.asyncio
+async def test_native_discord_rename_uses_only_native_adapter_kwargs():
+    """Relay-only kwargs must not be sent to the native Discord adapter."""
+    renames: list = []
+
+    class NativeAdapter:
+        async def rename_thread(
+            self,
+            thread_id,
+            name,
+            *,
+            only_if_current_name=None,
+        ):
+            renames.append((thread_id, name, only_if_current_name))
+            return True
+
+    class Runner:
+        _rename_discord_auto_thread_for_session_title = (
+            GatewayRunner._rename_discord_auto_thread_for_session_title
+        )
+        _sanitize_discord_thread_title = GatewayRunner._sanitize_discord_thread_title
+
+        def __init__(self):
+            self.adapters = {Platform.DISCORD: NativeAdapter()}
+
+        def _is_discord_auto_thread_lane(self, source):
+            return True
+
+        def _is_relay_discord_channel_lane(self, source):
+            return False
+
+        def _adapter_for_source(self, source):
+            return self.adapters[source.platform]
+
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="thread-1",
+        chat_type="thread",
+        thread_id="thread-1",
+        auto_thread_created=True,
+        auto_thread_initial_name="Original thread name",
+    )
+
+    await Runner()._rename_discord_auto_thread_for_session_title(
+        source,
+        "session-1",
+        "Generated session title",
+    )
+
+    assert renames == [
+        ("thread-1", "Generated session title", "Original thread name")
+    ]
