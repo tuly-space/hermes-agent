@@ -180,6 +180,33 @@ class TestIsForumParent:
 
 
 @pytest.mark.asyncio
+async def test_send_to_forum_uses_explicit_post_title():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    thread_channel = SimpleNamespace(id=777, send=AsyncMock())
+    thread = SimpleNamespace(
+        id=777,
+        message=SimpleNamespace(id=800),
+        thread=thread_channel,
+    )
+    forum_channel = _discord_mod.ForumChannel()
+    forum_channel.id = 999
+    forum_channel.create_thread = AsyncMock(return_value=thread)
+
+    result = await adapter._send_to_forum(
+        forum_channel,
+        "Full feedback investigation report",
+        thread_name="Cannot cancel subscription",
+    )
+
+    assert result.success is True
+    forum_channel.create_thread.assert_awaited_once_with(
+        name="Cannot cancel subscription",
+        content="Full feedback investigation report",
+    )
+    assert result.raw_response["thread_name"] == "Cannot cancel subscription"
+
+
+@pytest.mark.asyncio
 async def test_forum_post_file_creates_thread_with_attachment():
     """_forum_post_file routes file-bearing sends to create_thread with file kwarg."""
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
