@@ -1087,7 +1087,7 @@ def _seed_cron_thread_session(
     thread_id: str,
     mirror_text: str,
     chat_name: Optional[str] = None,
-) -> None:
+) -> bool:
     """Seed the freshly-opened cron thread's session with the brief.
 
     Without this the brief is *visible* in the new thread but absent from any
@@ -1104,40 +1104,41 @@ def _seed_cron_thread_session(
     """
     text = (mirror_text or "").strip()
     if not text:
-        return
+        return False
     try:
         from gateway.config import Platform
         from gateway.session import SessionSource
 
         session_store = getattr(adapter, "_session_store", None)
-        if session_store is not None:
-            try:
-                platform_enum = Platform(platform_name.lower())
-            except (ValueError, KeyError):
-                platform_enum = None
-            if platform_enum is not None:
-                # Discord thread destinations must key on the thread's OWN id
-                # to match how the Discord adapter keys organic in-thread
-                # messages (chat_id == thread_id). Other platforms (Slack,
-                # Telegram) use chat_id == parent_channel for thread messages,
-                # so the parent chat_id is correct for them. See the matching
-                # guard in GatewayRunner._process_handoff.
-                if platform_enum == Platform.DISCORD:
-                    seed_chat_id = str(thread_id)
-                else:
-                    seed_chat_id = str(chat_id)
-                dest_source = SessionSource(
-                    platform=platform_enum,
-                    chat_id=seed_chat_id,
-                    chat_name=chat_name,
-                    chat_type="thread",
-                    user_id="system:cron",
-                    user_name="Cron",
-                    thread_id=str(thread_id),
-                )
-                # Ensure the thread-keyed session row exists so the mirror has
-                # a target and the user's later reply joins the same session.
-                session_store.get_or_create_session(dest_source)
+        if session_store is None:
+            return False
+        try:
+            platform_enum = Platform(platform_name.lower())
+        except (ValueError, KeyError):
+            return False
+
+        # Discord thread destinations must key on the thread's OWN id
+        # to match how the Discord adapter keys organic in-thread
+        # messages (chat_id == thread_id). Other platforms (Slack,
+        # Telegram) use chat_id == parent_channel for thread messages,
+        # so the parent chat_id is correct for them. See the matching
+        # guard in GatewayRunner._process_handoff.
+        if platform_enum == Platform.DISCORD:
+            seed_chat_id = str(thread_id)
+        else:
+            seed_chat_id = str(chat_id)
+        dest_source = SessionSource(
+            platform=platform_enum,
+            chat_id=seed_chat_id,
+            chat_name=chat_name,
+            chat_type="thread",
+            user_id="system:cron",
+            user_name="Cron",
+            thread_id=str(thread_id),
+        )
+        # Ensure the thread-keyed session row exists so the mirror has
+        # a target and the user's later reply joins the same session.
+        session_store.get_or_create_session(dest_source)
 
         from gateway.mirror import mirror_to_session
 
@@ -1146,24 +1147,37 @@ def _seed_cron_thread_session(
         # in-thread reply produces assistant→user→... off a phantom assistant
         # message. Pass the seed user_id so the mirror resolves the exact
         # thread-keyed session row we just created.
-        mirror_to_session(
+        # Discord persists organic thread sessions with chat_id equal to the
+        # thread's own id. Use that same id for lookup; the parent forum id
+        # cannot resolve the row created above. Other platforms retain the
+        # parent chat id plus thread id tuple.
+        mirror_chat_id = seed_chat_id if platform_enum == Platform.DISCORD else str(chat_id)
+        mirrored = mirror_to_session(
             platform_name,
-            str(chat_id),
+            mirror_chat_id,
             f"[Cron delivery: {job.get('name') or job.get('id', 'cron')}]\n{text}",
             source_label="cron",
             thread_id=str(thread_id),
             user_id="system:cron",
             role="user",
         )
+        if not mirrored:
+            logger.warning(
+                "Job '%s': created continuable thread session %s but failed to seed the brief",
+                job.get("id", "?"), thread_id,
+            )
+            return False
         logger.info(
             "Job '%s': opened continuable thread %s on %s:%s and seeded the brief",
             job.get("id", "?"), thread_id, platform_name, chat_id,
         )
+        return True
     except Exception as e:
         logger.debug(
             "Job '%s': seeding cron thread session failed for %s:%s:%s: %s",
             job.get("id", "?"), platform_name, chat_id, thread_id, e,
         )
+        return False
 
 
 def _seed_explicit_discord_forum_session(
@@ -1190,7 +1204,7 @@ def _seed_explicit_discord_forum_session(
     forum_thread_id = str(send_raw_response.get("thread_id") or "").strip()
     if not forum_thread_id:
         return False
-    _seed_cron_thread_session(
+    return _seed_cron_thread_session(
         job,
         adapter,
         platform_name,
@@ -1198,7 +1212,6 @@ def _seed_explicit_discord_forum_session(
         forum_thread_id,
         mirror_text,
     )
-    return True
 
 
 def _seed_cron_channel_session(

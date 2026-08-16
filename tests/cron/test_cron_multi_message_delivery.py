@@ -108,7 +108,7 @@ def test_explicit_discord_forum_result_seeds_created_thread_session():
     adapter = MagicMock()
     job = {"id": "job-1", "attach_to_session": True}
 
-    with patch("cron.scheduler._seed_cron_thread_session") as seed:
+    with patch("cron.scheduler._seed_cron_thread_session", return_value=True) as seed:
         seeded = scheduler._seed_explicit_discord_forum_session(
             job,
             adapter,
@@ -144,3 +144,29 @@ def test_explicit_discord_non_forum_result_does_not_seed_session():
 
     assert seeded is False
     seed.assert_not_called()
+
+
+def test_discord_thread_seed_mirrors_using_thread_as_chat_id():
+    adapter = MagicMock()
+    adapter._session_store.get_or_create_session.return_value = object()
+
+    with patch("gateway.mirror.mirror_to_session", return_value=True) as mirror:
+        seeded = scheduler._seed_cron_thread_session(
+            {"id": "job-1", "name": "Forum cases"},
+            adapter,
+            "discord",
+            "1510950505835270144",
+            "1538381421289148417",
+            "Feedback case one",
+        )
+
+    assert seeded is True
+    mirror.assert_called_once_with(
+        "discord",
+        "1538381421289148417",
+        "[Cron delivery: Forum cases]\nFeedback case one",
+        source_label="cron",
+        thread_id="1538381421289148417",
+        user_id="system:cron",
+        role="user",
+    )
