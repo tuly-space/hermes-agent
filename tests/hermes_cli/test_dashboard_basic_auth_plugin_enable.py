@@ -65,7 +65,7 @@ class TestBasicProviderLoadsAfterUnblock:
         with patch.object(plugins_mod, "_plugin_manager", None):
             discover_plugins(force=True)
 
-        assert list_providers() == []
+        assert not any(p.name == "basic" for p in list_providers())
 
     def test_unblock_then_rediscover_registers_provider(
         self, hermes_home, monkeypatch,
@@ -91,6 +91,30 @@ class TestBasicProviderLoadsAfterUnblock:
         with patch.object(plugins_mod, "_plugin_manager", None):
             discover_plugins(force=True)
 
-        providers = list_providers()
+        providers = [p for p in list_providers() if p.name == "basic"]
         assert len(providers) == 1
         assert providers[0].name == "basic"
+
+    def test_non_interactive_config_reaches_provider(self, hermes_home):
+        password_hash = basic_plugin.hash_password("not-used")
+        _write_config(
+            hermes_home,
+            {
+                "dashboard": {
+                    "basic_auth": {
+                        "username": "browser-test",
+                        "password_hash": password_hash,
+                        "secret": "b" * 32,
+                        "interactive_login": False,
+                    }
+                }
+            },
+        )
+
+        class Context:
+            def register_dashboard_auth_provider(self, provider):
+                self.provider = provider
+
+        ctx = Context()
+        basic_plugin.register(ctx)
+        assert ctx.provider.interactive_login is False

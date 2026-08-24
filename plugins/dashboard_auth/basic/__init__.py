@@ -212,6 +212,7 @@ class BasicAuthProvider(DashboardAuthProvider):
         password_hash: str,
         secret: bytes,
         ttl_seconds: int = _DEFAULT_TTL_SECONDS,
+        interactive_login: bool = True,
     ) -> None:
         if not username:
             raise ValueError("username must be non-empty")
@@ -223,6 +224,7 @@ class BasicAuthProvider(DashboardAuthProvider):
         self._password_hash = password_hash
         self._secret = secret
         self._ttl = max(60, int(ttl_seconds))
+        self.interactive_login = bool(interactive_login)
 
     # ---- OAuth methods: not used (pure-password provider) ------------------
 
@@ -361,6 +363,16 @@ def _resolve(env_name: str, cfg_section: dict, cfg_key: str) -> str:
     return str(cfg_section.get(cfg_key, "") or "").strip()
 
 
+def _resolve_bool(
+    env_name: str, cfg_section: dict, cfg_key: str, *, default: bool
+) -> bool:
+    env = os.environ.get(env_name, "").strip()
+    raw = env if env else cfg_section.get(cfg_key, default)
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() not in {"0", "false", "no", "off"}
+
+
 def _resolve_secret(cfg_section: dict) -> bytes:
     """Resolve the token-signing secret.
 
@@ -415,6 +427,12 @@ def register(ctx) -> None:
     )
     ttl_raw = _resolve(
         "HERMES_DASHBOARD_BASIC_AUTH_TTL_SECONDS", section, "session_ttl_seconds"
+    )
+    interactive_login = _resolve_bool(
+        "HERMES_DASHBOARD_BASIC_AUTH_INTERACTIVE_LOGIN",
+        section,
+        "interactive_login",
+        default=True,
     )
 
     if not username:
@@ -478,6 +496,7 @@ def register(ctx) -> None:
             password_hash=password_hash,
             secret=secret,
             ttl_seconds=ttl,
+            interactive_login=interactive_login,
         )
     except ValueError as exc:
         LAST_SKIP_REASON = f"BasicAuthProvider construction failed: {exc}"

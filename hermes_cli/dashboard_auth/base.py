@@ -165,6 +165,12 @@ class DashboardAuthProvider(ABC):
     # and are completely unaffected.
     supports_password: bool = False
 
+    # Machine-minted or otherwise non-interactive session providers may set
+    # this False. They remain eligible for per-request session verification,
+    # but are not advertised and cannot be reached through any public login
+    # initiation route.
+    interactive_login: bool = True
+
     # When True, this provider can verify a non-interactive bearer token
     # (``verify_token``) presented on a single request by a service-to-service
     # caller — no login, no cookie, no refresh. This is the generic
