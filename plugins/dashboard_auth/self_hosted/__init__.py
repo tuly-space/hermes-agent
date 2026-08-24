@@ -56,6 +56,7 @@ same precedence convention as the ``nous`` plugin)::
           issuer: https://auth.example.com/application/o/hermes/   # required
           client_id: hermes-dashboard                              # required
           scopes: "openid profile email"                           # optional
+          allowed_emails: "owner@example.com"                      # optional
           # client_secret: set ONLY for a confidential client. It is a
           # credential — prefer the env var / ~/.hermes/.env over config.yaml.
 
@@ -63,6 +64,7 @@ same precedence convention as the ``nous`` plugin)::
     HERMES_DASHBOARD_OIDC_ISSUER
     HERMES_DASHBOARD_OIDC_CLIENT_ID
     HERMES_DASHBOARD_OIDC_SCOPES        # optional; defaults to "openid profile email"
+    HERMES_DASHBOARD_OIDC_ALLOWED_EMAILS # optional; comma-separated allowlist
     HERMES_DASHBOARD_OIDC_CLIENT_SECRET # optional; set for a confidential client
                                         # (the .env file is the canonical home —
                                         # it's a secret, not a behavioural setting)
@@ -184,6 +186,7 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
         client_id: str,
         scopes: str = _DEFAULT_SCOPES,
         client_secret: str = "",
+        allowed_emails: str = "",
     ) -> None:
         if not issuer:
             raise ValueError("issuer is required")
@@ -196,12 +199,19 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
         # trailing-slash mismatch between config and the IDP).
         self._issuer = issuer.rstrip("/")
         _require_https_or_loopback(self._issuer, field="issuer")
+        if self._issuer == "https://accounts.google.com":
+            self.display_name = "Google"
         self._client_id = client_id
         self._scopes = scopes.strip() or _DEFAULT_SCOPES
         # An empty/whitespace secret means "public client" — strip so a
         # provisioned-but-blank secret can't flip us into a broken confidential
         # mode that sends an empty client_secret. Non-empty ⇒ confidential.
         self._client_secret = (client_secret or "").strip()
+        self._allowed_emails = frozenset(
+            email.strip().casefold()
+            for email in (allowed_emails or "").split(",")
+            if email.strip()
+        )
 
         # Discovery + JWKS are lazily resolved on first use so plugin
         # registration never makes a network call (the IDP may be down at
@@ -232,6 +242,13 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
             "code_challenge": code_challenge,
             "code_challenge_method": "S256",
         }
+        # Google only returns a refresh token for web-server flows when
+        # offline access is requested.  Do not force ``prompt=consent`` here:
+        # a dedicated new client receives consent on first use, while repeat
+        # logins should remain quiet and use the existing grant when possible.
+        if self._issuer == "https://accounts.google.com":
+            params["access_type"] = "offline"
+            params["include_granted_scopes"] = "true"
         redirect_url = (
             f"{disco['authorization_endpoint']}?{urllib.parse.urlencode(params)}"
         )
@@ -680,6 +697,11 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
             raise ProviderError("ID token missing 'sub' (user_id) claim")
 
         email = str(claims.get("email", "") or "")
+        if self._allowed_emails:
+            if email.casefold() not in self._allowed_emails:
+                raise ProviderError("OIDC account is not authorized")
+            if claims.get("email_verified") is not True:
+                raise ProviderError("OIDC account email is not verified")
         # Standard OIDC display claims, in preference order.
         display_name = str(
             claims.get("name")
@@ -822,6 +844,9 @@ def register(ctx) -> None:
     client_secret = _resolve_setting(
         "HERMES_DASHBOARD_OIDC_CLIENT_SECRET", oidc_cfg.get("client_secret")
     )
+    allowed_emails = _resolve_setting(
+        "HERMES_DASHBOARD_OIDC_ALLOWED_EMAILS", oidc_cfg.get("allowed_emails")
+    )
 
     if not issuer or not client_id:
         LAST_SKIP_REASON = (
@@ -842,6 +867,7 @@ def register(ctx) -> None:
             client_id=client_id,
             scopes=scopes,
             client_secret=client_secret,
+            allowed_emails=allowed_emails,
         )
     except (ValueError, ProviderError) as exc:
         LAST_SKIP_REASON = (
@@ -853,10 +879,11 @@ def register(ctx) -> None:
     ctx.register_dashboard_auth_provider(provider)
     logger.info(
         "dashboard-auth-self-hosted: registered provider "
-        "(issuer=%s, client_id=%s, scopes=%r, confidential=%s)",
+        "(issuer=%s, client_id=%s, scopes=%r, confidential=%s, email_allowlist=%d)",
         issuer,
         client_id,
         scopes,
         # Log only whether a secret is present, never the secret itself.
         bool(client_secret),
+        len(provider._allowed_emails),
     )
