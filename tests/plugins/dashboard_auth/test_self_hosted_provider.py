@@ -132,6 +132,7 @@ def _make_provider(
     *,
     scopes: str | None = None,
     client_secret: str | None = None,
+    allowed_emails: str | None = None,
     auth_methods: Any = "__unset__",
 ):
     """Construct a provider with discovery + JWKS stubbed (no network).
@@ -146,6 +147,8 @@ def _make_provider(
         kwargs["scopes"] = scopes
     if client_secret is not None:
         kwargs["client_secret"] = client_secret
+    if allowed_emails is not None:
+        kwargs["allowed_emails"] = allowed_emails
     p = oidc_plugin.SelfHostedOIDCProvider(**kwargs)
     # Pre-seed discovery so nothing hits the network.
     disco = dict(_DISCOVERY_DOC)
@@ -195,6 +198,12 @@ class TestConstruction:
             issuer=_ISSUER + "/", client_id=_CLIENT_ID
         )
         assert p._issuer == _ISSUER
+
+    def test_google_issuer_uses_google_display_name(self):
+        p = oidc_plugin.SelfHostedOIDCProvider(
+            issuer="https://accounts.google.com", client_id=_CLIENT_ID
+        )
+        assert p.display_name == "Google"
 
     def test_requires_issuer(self):
         with pytest.raises(ValueError, match="issuer"):
@@ -311,6 +320,27 @@ class TestStartLogin:
         assert "state" in params
         assert "code_challenge" in params
 
+    def test_google_requests_offline_access_without_forcing_consent(self, rsa_keypair):
+        provider = oidc_plugin.SelfHostedOIDCProvider(
+            issuer="https://accounts.google.com", client_id=_CLIENT_ID
+        )
+        provider._discovery = {
+            **_DISCOVERY_DOC,
+            "issuer": "https://accounts.google.com",
+        }
+        provider._discovery_fetched_at = time.time()
+
+        result = provider.start_login(
+            redirect_uri="https://work.tuly.space/auth/callback"
+        )
+        params = dict(
+            urllib.parse.parse_qsl(urllib.parse.urlparse(result.redirect_url).query)
+        )
+
+        assert params["access_type"] == "offline"
+        assert params["include_granted_scopes"] == "true"
+        assert "prompt" not in params
+
 
     def test_state_in_cookie_matches_url(self, provider):
         result = provider.start_login(
@@ -377,6 +407,55 @@ class TestCompleteLogin:
                 redirect_uri="https://hermes.example/auth/callback",
             )
         assert session.refresh_token == ""
+
+    def test_email_allowlist_accepts_verified_case_insensitive_match(self, rsa_keypair):
+        provider = _make_provider(rsa_keypair, allowed_emails=" Alice@Example.com ")
+        id_token = _mint_id_token(
+            rsa_keypair,
+            email="alice@example.com",
+            extra_claims={"email_verified": True},
+        )
+        mock_resp = _mock_post(200, {"id_token": id_token, "token_type": "Bearer"})
+        with patch(
+            "plugins.dashboard_auth.self_hosted.httpx.post", return_value=mock_resp
+        ):
+            session = provider.complete_login(
+                code="abc",
+                state="s",
+                code_verifier="vfy",
+                redirect_uri="https://hermes.example/auth/callback",
+            )
+        assert session.email == "alice@example.com"
+
+    @pytest.mark.parametrize(
+        ("email", "email_verified", "message"),
+        [
+            ("mallory@example.com", True, "not authorized"),
+            ("alice@example.com", False, "not verified"),
+            ("alice@example.com", None, "not verified"),
+        ],
+    )
+    def test_email_allowlist_rejects_unapproved_or_unverified_identity(
+        self, rsa_keypair, email, email_verified, message
+    ):
+        provider = _make_provider(rsa_keypair, allowed_emails="alice@example.com")
+        extra_claims = {}
+        if email_verified is not None:
+            extra_claims["email_verified"] = email_verified
+        id_token = _mint_id_token(
+            rsa_keypair, email=email, extra_claims=extra_claims
+        )
+        mock_resp = _mock_post(200, {"id_token": id_token, "token_type": "Bearer"})
+        with patch(
+            "plugins.dashboard_auth.self_hosted.httpx.post", return_value=mock_resp
+        ):
+            with pytest.raises(ProviderError, match=message):
+                provider.complete_login(
+                    code="abc",
+                    state="s",
+                    code_verifier="vfy",
+                    redirect_uri="https://hermes.example/auth/callback",
+                )
 
     def test_missing_id_token_raises(self, provider):
         mock_resp = _mock_post(
@@ -616,6 +695,7 @@ class TestPluginRegister:
             "HERMES_DASHBOARD_OIDC_CLIENT_ID",
             "HERMES_DASHBOARD_OIDC_SCOPES",
             "HERMES_DASHBOARD_OIDC_CLIENT_SECRET",
+            "HERMES_DASHBOARD_OIDC_ALLOWED_EMAILS",
         ):
             monkeypatch.delenv(var, raising=False)
 
@@ -650,6 +730,7 @@ class TestPluginRegister:
         assert registered._issuer == _ISSUER
         assert registered._client_id == _CLIENT_ID
         assert registered._scopes == "openid profile email"
+        assert registered._allowed_emails == frozenset()
         assert oidc_plugin.LAST_SKIP_REASON == ""
 
 
@@ -680,6 +761,20 @@ class TestPluginRegister:
         oidc_plugin.register(ctx)  # must not raise
         ctx.register_dashboard_auth_provider.assert_not_called()
 
+    def test_allowed_emails_from_env(self, patch_config, monkeypatch):
+        patch_config(None)
+        monkeypatch.setenv("HERMES_DASHBOARD_OIDC_ISSUER", _ISSUER)
+        monkeypatch.setenv("HERMES_DASHBOARD_OIDC_CLIENT_ID", _CLIENT_ID)
+        monkeypatch.setenv(
+            "HERMES_DASHBOARD_OIDC_ALLOWED_EMAILS",
+            " Alice@example.com, bob@example.com ",
+        )
+        ctx = MagicMock()
+        oidc_plugin.register(ctx)
+        registered = ctx.register_dashboard_auth_provider.call_args.args[0]
+        assert registered._allowed_emails == frozenset(
+            {"alice@example.com", "bob@example.com"}
+        )
 
     # -- client_secret wiring ----------------------------------------------
 
