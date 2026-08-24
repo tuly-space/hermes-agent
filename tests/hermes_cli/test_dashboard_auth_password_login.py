@@ -177,6 +177,9 @@ class TestProtocolExtension:
         # OAuth providers (the Stub) inherit the False default.
         assert StubAuthProvider.supports_password is False
 
+    def test_default_interactive_login_is_true(self):
+        assert StubAuthProvider.interactive_login is True
+
     def test_default_complete_password_login_raises_not_implemented(self):
         # A provider that doesn't override the method (the Stub) raises,
         # rather than silently accepting any credentials.
@@ -207,6 +210,32 @@ class TestProviderListFlag:
         assert login.status_code == 200
         assert '<form class="provider-form" data-provider="testpw"' in login.text
         assert "/auth/password-login" in login.text
+
+    def test_non_interactive_provider_is_hidden_and_cannot_login(
+        self, gated_app, pw_provider
+    ):
+        pw_provider.interactive_login = False
+        register_provider(StubAuthProvider())
+
+        bootstrap = gated_app.get("/api/auth/providers")
+        assert bootstrap.status_code == 200
+        assert {p["name"] for p in bootstrap.json()["providers"]} == {"stub"}
+
+        redirect_login = gated_app.get(
+            "/auth/login?provider=testpw", follow_redirects=False
+        )
+        assert redirect_login.status_code == 404
+
+        password_login = gated_app.post(
+            "/auth/password-login",
+            json={
+                "provider": "testpw",
+                "username": "admin",
+                "password": "hunter2",
+                "next": "/",
+            },
+        )
+        assert password_login.status_code == 404
 
 
     def test_oauth_provider_reports_false(self):

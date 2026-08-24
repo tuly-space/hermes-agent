@@ -151,9 +151,14 @@ async def login_page(request: Request) -> HTMLResponse:
 
 @router.get("/api/auth/providers", name="auth_providers")
 async def api_auth_providers() -> Any:
-    # Advertise only interactive providers; a token-only credential (e.g. drain)
-    # is not a sign-in option.
-    providers = list_session_providers()
+    # Advertise only providers that explicitly support interactive login.
+    # Machine-minted session providers may still verify cookies without
+    # exposing a public login initiation surface.
+    providers = [
+        p
+        for p in list_session_providers()
+        if getattr(p, "interactive_login", True)
+    ]
     if not providers:
         # Q13: fail-closed when zero providers are registered.
         return JSONResponse(
@@ -187,7 +192,9 @@ async def auth_login(request: Request, provider: str, next: str = ""):
             status_code=404,
             detail=f"Unknown provider: {provider!r}",
         )
-    if not getattr(p, "supports_session", True):
+    if not getattr(p, "supports_session", True) or not getattr(
+        p, "interactive_login", True
+    ):
         raise HTTPException(
             status_code=404,
             detail=f"Provider does not support interactive login: {provider!r}",
@@ -339,6 +346,7 @@ async def auth_native_authorize(
             pp
             for pp in list_session_providers()
             if not getattr(pp, "supports_password", False)
+            and getattr(pp, "interactive_login", True)
         ]
         if len(native_eligible) == 1:
             p = native_eligible[0]
@@ -353,8 +361,14 @@ async def auth_native_authorize(
         raise HTTPException(
             status_code=404, detail=f"Unknown provider: {provider!r}"
         )
-    if not getattr(p, "supports_session", True):
-        # Token-only credentials (e.g. drain) are not interactive sign-ins.
+    if (
+        not getattr(p, "supports_session", True)
+        or not getattr(p, "interactive_login", True)
+        or getattr(p, "supports_password", False)
+    ):
+        # Native PKCE brokering is only meaningful for redirect/OAuth
+        # providers; token-only credentials, hidden session providers, and
+        # password providers have no IDP round trip to broker.
         raise HTTPException(
             status_code=400,
             detail=f"Provider does not support native login: {p.name!r}",
@@ -734,7 +748,11 @@ async def auth_password_login(request: Request, body: _PasswordLoginBody):
         )
 
     p = get_provider(body.provider)
-    if p is None or not getattr(p, "supports_password", False):
+    if (
+        p is None
+        or not getattr(p, "supports_password", False)
+        or not getattr(p, "interactive_login", True)
+    ):
         # Don't leak which providers exist or which support passwords —
         # same 404 whether the provider is unknown or OAuth-only.
         audit_log(
