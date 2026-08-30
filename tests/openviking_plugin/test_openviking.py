@@ -946,6 +946,9 @@ class TestEnsureClientReloadsEnv:
         monkeypatch.setattr("plugins.memory.openviking._VikingClient", _StubClient)
         monkeypatch.setenv("OPENVIKING_ENDPOINT", "https://openviking.example")
         monkeypatch.setenv("OPENVIKING_API_KEY", "sk-test")
+        monkeypatch.delenv("OPENVIKING_ACCOUNT", raising=False)
+        monkeypatch.delenv("OPENVIKING_USER", raising=False)
+        monkeypatch.delenv("OPENVIKING_AGENT", raising=False)
 
         provider = OpenVikingMemoryProvider()
         provider.initialize("session-1")
