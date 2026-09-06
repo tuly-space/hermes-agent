@@ -1,4 +1,4 @@
-"""Native OpenAI Responses server-side compaction — gpt-5.6 on direct OpenAI routes only.
+"""Native Responses compaction for GPT-5.6/GPT-6 on supported routes.
 
 OpenAI's Responses API supports server-side compaction: include
 ``context_management=[{"type": "compaction", "compact_threshold": N}]`` in a
@@ -11,17 +11,16 @@ Docs: https://developers.openai.com/api/docs/guides/compaction
 
 Hermes' support is deliberately narrow (live verification, Aug 2026):
 
-* **gpt-5.6 family only.** gpt-5.6 and its variants compact correctly.
+* **GPT-5.6 and GPT-6 families.** GPT-6 Astra was also verified through the
+  local Codex proxy with encrypted-checkpoint-only recall (Sep 2026).
   Sending the field to gpt-5.1 / gpt-5.2 reliably fails server-side —
   HTTP 500 on the blocking path and a permanent stall on the streaming
   path (90s watchdog x 3 retries = a dead turn). There is no structured
   "unsupported" rejection to downgrade on, so the only safe gate is an
   explicit model-family check.
-* **Direct OpenAI routes only:** api.openai.com (API key) or the ChatGPT
-  Codex backend (subscription OAuth). Every other Responses surface
-  (xAI, GitHub/Copilot, relays, local servers) never sees the field —
-  most would 400 on the unknown parameter, and none can mint or decrypt
-  the compaction blob.
+* **Direct OpenAI or the verified local Codex proxy:** api.openai.com,
+  the ChatGPT Codex backend, and the explicitly allowlisted proxy endpoint.
+  Other routes remain denied unless explicitly trusted by capability.
 
 Ownership model: Hermes' local compression stays fully armed as the
 fallback owner. The native threshold is clamped safely below the local
@@ -43,6 +42,7 @@ introduces no cycle.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit
 
@@ -64,8 +64,32 @@ _ELIGIBLE_MODEL_MARKER = "gpt-5.6"
 
 
 def is_native_compaction_model(model: Optional[str]) -> bool:
-    """True when the model is in the gpt-5.6 family."""
-    return _ELIGIBLE_MODEL_MARKER in (model or "").lower()
+    """True for the supported GPT-5.6 and GPT-6 families."""
+    normalized = (model or "").lower()
+    return _ELIGIBLE_MODEL_MARKER in normalized or bool(
+        re.fullmatch(r"gpt-6(?:[.-][a-z0-9]+)*", normalized)
+    )
+
+
+def is_verified_local_codex_route(
+    base_url: Optional[str], provider: Optional[str] = None,
+) -> bool:
+    """Allow only the live-verified local proxy, not arbitrary custom routes."""
+    if (provider or "").strip().lower() not in (
+        "", "custom", "custom:local-codex-proxy",
+    ):
+        return False
+    try:
+        url = urlsplit(base_url or "")
+        return (
+            url.scheme == "https"
+            and url.hostname == "us-lrv03-sj4srl0f0-react-work.taila837d.ts.net"
+            and url.port in (None, 443)
+            and url.path.rstrip("/") == "/v1"
+            and not (url.username or url.password or url.query or url.fragment)
+        )
+    except ValueError:
+        return False
 
 
 def resolve_native_compaction_capabilities(
@@ -85,6 +109,7 @@ def resolve_native_compaction_capabilities(
     eligible = is_native_compaction_model(model) and (
         direct_default
         or is_direct_openai_route(base_url, is_codex_backend=is_codex_backend)
+        or is_verified_local_codex_route(base_url, provider)
     )
     return {"native_compaction": eligible}
 
@@ -205,6 +230,8 @@ def native_compaction_context_management(
         return None
     trusted_proxy = bool(
         getattr(agent, "capabilities", {}).get("openai_native_compaction", False)
+    ) or is_verified_local_codex_route(
+        getattr(agent, "base_url", None), getattr(agent, "provider", None)
     )
     if not trusted_proxy and not is_direct_openai_route(
         getattr(agent, "base_url", None), is_codex_backend=is_codex_backend
