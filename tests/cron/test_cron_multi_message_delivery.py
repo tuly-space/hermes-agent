@@ -2,7 +2,7 @@
 
 from unittest.mock import MagicMock, patch
 
-from cron import scheduler
+from cron import scheduler_delivery as scheduler
 
 
 def test_deliver_result_splits_explicit_message_breaks(monkeypatch):
@@ -138,7 +138,7 @@ def test_explicit_discord_forum_result_seeds_created_thread_session():
     adapter = MagicMock()
     job = {"id": "job-1", "attach_to_session": True}
 
-    with patch("cron.scheduler._seed_cron_thread_session", return_value=True) as seed:
+    with patch("cron.scheduler_delivery._seed_cron_thread_session", return_value=True) as seed:
         seeded = scheduler._seed_explicit_discord_forum_session(
             job,
             adapter,
@@ -161,7 +161,7 @@ def test_explicit_discord_forum_result_seeds_created_thread_session():
 
 
 def test_explicit_discord_non_forum_result_does_not_seed_session():
-    with patch("cron.scheduler._seed_cron_thread_session") as seed:
+    with patch("cron.scheduler_delivery._seed_cron_thread_session") as seed:
         seeded = scheduler._seed_explicit_discord_forum_session(
             {"id": "job-1", "attach_to_session": True},
             MagicMock(),
@@ -203,3 +203,81 @@ def test_discord_thread_seed_mirrors_into_exact_created_session():
         role="user",
         session_id="seeded-session",
     )
+
+
+def test_multi_message_forum_delivery_seeds_the_real_reply_sessions(tmp_path, monkeypatch):
+    """Exercise the facade → router → native adapter → real transcript path."""
+    import asyncio
+    from concurrent.futures import Future
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from cron.scheduler import _deliver_result
+    from gateway.config import GatewayConfig, Platform, PlatformConfig
+    from gateway.session import SessionSource, SessionStore
+    from plugins.platforms.discord.adapter import DiscordAdapter
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    config = GatewayConfig(platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="test")})
+    monkeypatch.setattr("gateway.config.load_gateway_config", lambda: config)
+    monkeypatch.setattr("cron.scheduler.load_config", lambda: {"cron": {"wrap_response": False}})
+    store = SessionStore(tmp_path / "sessions", config)
+    adapter = DiscordAdapter(config.platforms[Platform.DISCORD])
+    adapter._session_store = store
+    posts = []
+
+    async def create_thread(*, name, content):
+        thread_id = str(200 + len(posts))
+        posts.append((thread_id, name, content))
+        return SimpleNamespace(
+            thread=SimpleNamespace(id=int(thread_id), send=AsyncMock()),
+            message=SimpleNamespace(id=int(thread_id)),
+        )
+
+    forum = SimpleNamespace(id=100, create_thread=create_thread)
+    adapter._is_forum_parent = lambda channel: channel is forum
+    adapter._client = SimpleNamespace(get_channel=lambda cid: forum, fetch_channel=AsyncMock())
+    loop = MagicMock()
+    loop.is_running.return_value = True
+
+    def run_coro(coro, loop):
+        future = Future()
+        try:
+            future.set_result(asyncio.run(coro))
+        except BaseException as exc:
+            future.set_exception(exc)
+        return future
+
+    monkeypatch.setattr("asyncio.run_coroutine_threadsafe", run_coro)
+    job = {"id": "forum-cases", "name": "Forum cases", "deliver": "discord:100",
+           "attach_to_session": True}
+    content = ("[CRON_MESSAGE_TITLE] First case\nFirst brief\n[CRON_MESSAGE_BREAK]\n"
+               "[CRON_MESSAGE_TITLE] Second case\nSecond brief")
+    assert _deliver_result(job, content, adapters={Platform.DISCORD: adapter}, loop=loop) is None
+    assert [(title, body) for _, title, body in posts] == [
+        ("First case", "First brief"), ("Second case", "Second brief")]
+    for thread_id, _, body in posts:
+        source = SessionSource(platform=Platform.DISCORD, chat_id=thread_id,
+                               thread_id=thread_id, chat_type="thread", user_id="human")
+        entry = store.get_or_create_session(source)
+        assert [(m["role"], m["content"]) for m in store.load_transcript(entry.session_id)] == [
+            ("user", "[Cron delivery: Forum cases]\n" + body)]
+
+
+def test_external_worker_hands_off_all_parts_under_one_execution(tmp_path, monkeypatch):
+    import cron.delivery_queue as queue
+
+    content = "First brief\n[CRON_MESSAGE_BREAK]\nSecond brief"
+    job = {"id": "job-1", "execution_id": "exec-1", "deliver": "discord:100"}
+    monkeypatch.setenv("_HERMES_CRON_EXTERNAL_WORKER", "exec-1")
+    monkeypatch.setattr(queue, "DELIVERY_DB", tmp_path / "delivery.db")
+
+    def enqueue_without_wait(execution, job, content, *, for_failure=False):
+        queue.enqueue(execution, job, content, for_failure=for_failure)
+        return None
+
+    monkeypatch.setattr(queue, "enqueue_and_wait", enqueue_without_wait)
+    assert scheduler._deliver_result(job, content) is None
+    record = queue.claim_next()
+    assert record["content"] == content
+    assert queue.claim_next() is None

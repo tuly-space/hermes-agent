@@ -1,10 +1,7 @@
 import json
 import os
 import socket
-import stat
 import threading
-import time
-import zipfile
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -14,7 +11,6 @@ import plugins.memory.openviking as openviking_module
 from hermes_cli import __version__ as _HERMES_VERSION
 from plugins.memory.openviking import (
     OpenVikingMemoryProvider,
-    _DEFERRED_COMMIT_TIMEOUT,
     _VikingClient,
 )
 
@@ -61,18 +57,6 @@ def _allow_setup_validation(monkeypatch, *, root_access: bool = False):
         openviking_module,
         "_validate_openviking_reachability",
         lambda endpoint: (True, ""),
-        raising=False,
-    )
-    monkeypatch.setattr(
-        openviking_module,
-        "_validate_openviking_auth",
-        lambda values: (True, ""),
-        raising=False,
-    )
-    monkeypatch.setattr(
-        openviking_module,
-        "_validate_openviking_root_access",
-        lambda values: (root_access, "" if root_access else "Requires role: root"),
         raising=False,
     )
     monkeypatch.setattr(
@@ -259,7 +243,7 @@ def test_link_ovcli_profile_removes_stale_inline_config(tmp_path):
     }
     ovcli_path = tmp_path / "ovcli.conf.VPS_ROOT"
 
-    openviking_module._link_ovcli_profile(
+    openviking_module._setup._link_ovcli_profile(
         config=config,
         provider_config=provider_config,
         env_path=env_path,
@@ -274,7 +258,10 @@ def test_link_ovcli_profile_removes_stale_inline_config(tmp_path):
     assert "OTHER_KEY=keep" in env_path.read_text(encoding="utf-8")
 
 
-def test_post_setup_existing_profile_picker_validates_and_links_saved_profile(tmp_path, monkeypatch):
+@pytest.mark.parametrize("peer_key", [None, "actor_peer_id", "agent_id"])
+def test_post_setup_existing_profile_picker_validates_and_links_saved_profile(
+    tmp_path, monkeypatch, peer_key,
+):
     _clear_openviking_env(monkeypatch)
     hermes_home = tmp_path / "hermes"
     hermes_home.mkdir()
@@ -285,10 +272,10 @@ def test_post_setup_existing_profile_picker_validates_and_links_saved_profile(tm
     active_path = openviking_home / "ovcli.conf"
     saved_path = openviking_home / "ovcli.conf.VPS"
     active_path.write_text(json.dumps({"url": "http://active.test"}), encoding="utf-8")
-    saved_path.write_text(
-        json.dumps({"url": "https://vps.example", "api_key": "user-key"}),
-        encoding="utf-8",
-    )
+    saved_values = {"url": "https://vps.example", "api_key": "user-key"}
+    if peer_key:
+        saved_values[peer_key] = "existing-peer"
+    saved_path.write_text(json.dumps(saved_values), encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
     monkeypatch.setattr(openviking_module.Path, "home", staticmethod(lambda: tmp_path))
 
@@ -318,7 +305,7 @@ def test_post_setup_existing_profile_picker_validates_and_links_saved_profile(tm
         "root_api_key": "",
         "account": "",
         "user": "",
-        "agent": "",
+        "agent": "existing-peer" if peer_key else "",
     }]
     assert config["memory"]["provider"] == "openviking"
     assert config["memory"]["openviking"] == {
@@ -328,6 +315,9 @@ def test_post_setup_existing_profile_picker_validates_and_links_saved_profile(tm
     env_text = env_path.read_text(encoding="utf-8")
     assert "OPENVIKING_" not in env_text
     assert "OTHER_KEY=keep" in env_text
+    settings = openviking_module._resolve_connection_settings(config["memory"]["openviking"])
+    assert settings["agent"] == ("existing-peer" if peer_key else "")
+    assert json.loads(saved_path.read_text(encoding="utf-8")) == saved_values
 
 
 def test_local_setup_recommends_user_api_key_before_unauthenticated_mode(monkeypatch):
@@ -355,11 +345,9 @@ def test_local_setup_recommends_user_api_key_before_unauthenticated_mode(monkeyp
         if label == "OpenViking user API key":
             assert secret is True
             return "user-key"
-        if label == openviking_module._AGENT_PROMPT_LABEL:
-            return default
         raise AssertionError(f"Unexpected prompt: {label}")
 
-    values = openviking_module._prompt_manual_connection_values(
+    values = openviking_module._setup._prompt_manual_connection_values(
         prompt,
         select,
         -1,
@@ -623,7 +611,7 @@ def test_handle_unreachable_endpoint_waits_long_enough_after_autostart(monkeypat
         lambda endpoint, *, timeout_seconds=0: wait_calls.append((endpoint, timeout_seconds)) or True,
     )
 
-    result = openviking_module._handle_unreachable_endpoint(
+    result = openviking_module._setup._handle_unreachable_endpoint(
         "http://127.0.0.1:1934",
         "OpenViking server is not reachable.",
         lambda *args, **kwargs: 0,
@@ -1107,7 +1095,6 @@ def test_sync_turn_captures_session_id_before_worker_runs():
     """Worker must use the session id snapshotted at sync_turn() call time, not
     re-read self._session_id later — otherwise a delayed worker can write the
     previous turn's messages into the rotated-in NEW session."""
-    import threading
 
     provider = OpenVikingMemoryProvider()
     provider._client = MagicMock()
@@ -1243,7 +1230,6 @@ def test_concurrent_providers_claim_unlocked_pending_owner_once(
     owner_run_id,
 ):
     """Only one provider may recover a missing or legacy owner lock."""
-    import threading
 
     pytest.importorskip("fcntl")
     _clear_openviking_env(monkeypatch)
@@ -1310,7 +1296,6 @@ def test_concurrent_providers_claim_unlocked_pending_owner_once(
 
 
 def test_shutdown_waits_for_memory_write_worker(monkeypatch):
-    import threading
 
     provider = OpenVikingMemoryProvider()
     provider._client = MagicMock()
@@ -1358,7 +1343,6 @@ def test_shutdown_waits_for_memory_write_worker(monkeypatch):
 
 
 def test_memory_write_uses_one_connection_for_identity_uri_and_post(monkeypatch):
-    import threading
 
     provider = OpenVikingMemoryProvider()
     provider._agent = "alice-agent"
@@ -1409,6 +1393,84 @@ def test_memory_write_uses_one_connection_for_identity_uri_and_post(monkeypatch)
         "viking://user/alice/peers/alice-agent/memories/preferences/mem_"
     )
     assert provider._memory_write_threads == set()
+
+
+@pytest.mark.parametrize("category, metadata, memory_type", [
+    (None, {}, "patterns"),
+    ("preference", {"topic": "回答风格"}, "preferences"),
+    ("entity", {"category": "project", "name": "Hermes"}, "entities"),
+    ("event", {"event_name": "release", "goal": "ship"}, "events"),
+    ("case", {"case_name": "fix", "task_signature": "bug", "input": "trace", "rubric": "tests"}, "cases"),
+])
+def test_remember_preserves_structured_fields_and_rejects_incomplete_writes(
+    monkeypatch, category, metadata, memory_type,
+):
+    provider = OpenVikingMemoryProvider()
+    provider._user = "alice"
+    client = MagicMock()
+    client.get.return_value = {"result": {"user": "alice"}}
+    client.post.return_value = {"result": {"written_bytes": 42}}
+    monkeypatch.setattr(provider, "_ensure_client", lambda: client)
+    args = {"content": "记住这个事实", "metadata": metadata}
+    if category:
+        args["category"] = category
+        for required in metadata:
+            incomplete = dict(metadata)
+            incomplete.pop(required)
+            result = json.loads(provider._tool_remember({**args, "metadata": incomplete}))
+            assert required in result["error"]
+            client.post.assert_not_called()
+    result = json.loads(provider._tool_remember(args))
+    assert result["status"] == "stored"
+    path, payload = client.post.call_args.args
+    assert path == "/api/v1/content/write"
+    text, fields = payload["content"].split("\n\n<!-- MEMORY_FIELDS\n")
+    fields = json.loads(fields.removesuffix("\n-->"))
+    assert text == args["content"]
+    assert fields["memory_type"] == memory_type
+    assert all(fields[key] == value for key, value in metadata.items())
+    if category == "preference":
+        assert fields["user"] == "alice"
+    assert result["uri"] == payload["uri"]
+    assert f"/memories/{memory_type}/" in result["uri"]
+    assert payload["mode"] == "create"
+
+
+def test_search_deduplicates_before_applying_the_caller_budget():
+    provider = OpenVikingMemoryProvider()
+    provider._client = MagicMock()
+    provider._client.post.return_value = {"result": {
+        "total": 99,
+        "memories": [
+            {"uri": "viking://same", "score": 0.4, "abstract": "old"},
+            {"uri": "viking://other", "score": 0.8},
+        ],
+        "resources": [
+            {"uri": "viking://same", "score": 0.9, "abstract": "best"},
+            {"uri": "viking://third", "score": 0.7},
+        ],
+    }}
+    result = json.loads(provider._tool_search({"query": "fact", "mode": "deep", "limit": 2}))
+    assert result["total"] == len(result["results"]) == 2
+    assert [item["uri"] for item in result["results"]] == ["viking://same", "viking://other"]
+    assert result["results"][0]["abstract"] == "best"
+
+
+@pytest.mark.parametrize("wait, timeout, expected", [
+    (False, 120, None), (True, None, 305.0), (True, 120, 125.0), (True, 1, 30.0),
+])
+def test_resource_wait_extends_http_timeout_only_for_waiting_calls(wait, timeout, expected):
+    provider = OpenVikingMemoryProvider()
+    provider._client = MagicMock()
+    provider._client.post.return_value = {"result": {"status": "ok"}}
+    args = {"url": "https://example.com/resource", "wait": wait}
+    if timeout is not None:
+        args["timeout"] = timeout
+    provider._tool_add_resource(args)
+    call = provider._client.post.call_args
+    assert call.args[0] == "/api/v1/resources"
+    assert call.args[1]["wait"] is wait
+    assert call.kwargs == ({} if expected is None else {"timeout": expected})
 
 
 def _make_prefetch_provider() -> OpenVikingMemoryProvider:
