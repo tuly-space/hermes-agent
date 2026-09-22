@@ -60,8 +60,6 @@ _OVCLI_SAVED_PREFIX = "ovcli.conf."
 _CONNECTION_KEYS = ("endpoint", "api_key", "account", "user", "agent")
 _OPENVIKING_ENV_KEYS = tuple(f"OPENVIKING_{key.upper()}" for key in _CONNECTION_KEYS)
 _TIMEOUT = 30.0
-_RESOURCE_WAIT_TIMEOUT = 300.0
-_RESOURCE_WAIT_RESPONSE_MARGIN = 5.0
 _SESSION_DRAIN_TIMEOUT = 10.0
 _DEFERRED_COMMIT_TIMEOUT = (_TIMEOUT * 2) + 5.0
 _SESSION_MESSAGE_BATCH_LIMIT = 100
@@ -112,43 +110,6 @@ _SESSION_START_LIST_PARAMS = {"output": "agent", "recursive": True, "abs_limit":
 _MEMORY_WRITE_TARGET_SUBDIR_MAP = {"user": "preferences", "memory": "patterns"}
 # OpenViking-generated summaries; non-.md sidecars are already rejected by the .md check.
 _GENERATED_MEMORY_SUMMARY_FILENAMES = {".abstract.md", ".overview.md"}
-
-# Maps the viking_remember `category` enum to a viking:// subdirectory.
-# Keep in sync with REMEMBER_SCHEMA.parameters.properties.category.enum.
-_CATEGORY_SUBDIR_MAP = {
-    "preference": "preferences",
-    "entity": "entities",
-    "event": "events",
-    "case": "cases",
-    "pattern": "patterns",
-}
-_DEFAULT_MEMORY_SUBDIR = "patterns"
-
-# OpenViking memory directories with embedding templates require these
-# structured MEMORY_FIELDS.  Direct content/write calls bypass OpenViking's
-# session extraction, so the Hermes tool must either supply the fields or
-# reject the write instead of silently forcing plain-content embeddings.
-_CATEGORY_REQUIRED_METADATA = {
-    "preference": ("topic",),  # ``user`` is filled from the active tenant.
-    "entity": ("category", "name"),
-    "event": ("event_name", "goal"),
-    "case": ("case_name", "task_signature", "input", "rubric"),
-    "pattern": (),
-}
-
-
-def _serialize_memory_fields(content: str, memory_type: str, metadata: dict) -> str:
-    """Serialize direct writes in OpenViking's native MEMORY_FIELDS format."""
-    clean_metadata = {
-        str(key): value
-        for key, value in metadata.items()
-        if value is not None and (not isinstance(value, str) or value.strip())
-    }
-    clean_metadata.setdefault("version", 1)
-    clean_metadata["memory_type"] = memory_type
-    metadata_json = json.dumps(clean_metadata, indent=2, ensure_ascii=False)
-    return f"{content.rstrip()}\n\n<!-- MEMORY_FIELDS\n{metadata_json}\n-->"
-
 _LOCAL_OPENVIKING_HOSTS = {"localhost", "127.0.0.1", "::1"}
 _LOCAL_OPENVIKING_AUTOSTART_TIMEOUT = 60.0
 _LOCAL_OPENVIKING_PROBE_TIMEOUT = 2.0  # loopback connect budget; only guards against a wedged listener
@@ -449,48 +410,16 @@ BROWSE_SCHEMA = _tool_schema(
     ["action"],
 )
 
-REMEMBER_SCHEMA = {
-    "name": "viking_remember",
-    "description": (
-        "Explicitly store a fact or memory in the OpenViking knowledge base. "
-        "Use for important information the agent should remember long-term. "
-        "Generic free-form memories default to pattern. Structured categories "
-        "require category-specific metadata so OpenViking can build its native embedding."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "content": {"type": "string", "description": "The information to remember."},
-            "category": {
-                "type": "string",
-                "enum": ["preference", "entity", "event", "case", "pattern"],
-                "description": "Memory category (default: pattern).",
-            },
-            "metadata": {
-                "type": "object",
-                "description": (
-                    "Structured OpenViking fields. preference requires topic; "
-                    "entity requires category and name; event requires event_name and goal; "
-                    "case requires case_name, task_signature, input, and rubric."
-                ),
-                "properties": {
-                    "topic": {"type": "string"},
-                    "user": {"type": "string"},
-                    "category": {"type": "string"},
-                    "name": {"type": "string"},
-                    "event_name": {"type": "string"},
-                    "goal": {"type": "string"},
-                    "case_name": {"type": "string"},
-                    "task_signature": {"type": "string"},
-                    "input": {"type": "string"},
-                    "rubric": {"type": "string"},
-                },
-                "additionalProperties": True,
-            },
-        },
-        "required": ["content"],
-    },
-}
+REMEMBER_SCHEMA = _tool_schema(
+    "viking_remember",
+    "Submit important long-term information to OpenViking through session memory extraction. Success means the source was "
+    "submitted, not that a distinct memory file was created. OpenViking can add, merge, or skip the final memory. Use this tool "
+    "when OpenViking should decide how to retain the information. Do not use it when an exact memory file or URI is required. "
+    "If the message is accepted but commit fails, it normally remains live and unextracted because server auto-commit is "
+    "disabled by default; follow the returned recovery instructions.",
+    {"content": _str("The information to remember.")},
+    ["content"],
+)
 
 FORGET_SCHEMA = _tool_schema(
     "viking_forget",
@@ -2509,28 +2438,11 @@ class OpenVikingMemoryProvider(MemoryProvider):
         except Exception as e:
             logger.debug("OpenViking memory mirror client creation failed: %s", e)
             return
-        mirror_metadata: Dict[str, Any] = {}
-        if subdir == "preferences":
-            # Built-in user-memory writes do not carry OpenViking's preference
-            # fields. Add deterministic tenant/topic metadata rather than
-            # forcing the server to fall back to a plain-content embedding.
-            first_line = next((line.strip() for line in content.splitlines() if line.strip()), content)
-            mirror_metadata = {
-                "user": self._user or "user",
-                "topic": first_line[:160],
-            }
-        serialized_content = _serialize_memory_fields(content, subdir, mirror_metadata)
 
         def _write():
             try:
-                uri = self._build_memory_uri(
-                    subdir, client=client, timeout=_RECALL_MIN_TIMEOUT_SECONDS,
-                )
-                client.post("/api/v1/content/write", {
-                    "uri": uri,
-                    "content": serialized_content,
-                    "mode": "create",
-                })
+                uri = self._build_memory_uri(subdir, client=client, timeout=_RECALL_MIN_TIMEOUT_SECONDS)
+                client.post("/api/v1/content/write", {"uri": uri, "content": content, "mode": "create"})
             except Exception as e:
                 logger.debug("OpenViking memory mirror failed: %s", e)
 
@@ -2613,32 +2525,8 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 if item.get("relations"):
                     entry["related"] = [r.get("uri") for r in item["relations"][:3]]
                 scored_entries.append((raw_score if raw_score is not None else 0.0, entry))
-
-        # Deep search can return the same URI from multiple reasoning plans or
-        # context buckets. Keep the highest-scoring representation so repeated
-        # evidence does not consume the caller's result budget.
-        best_by_uri: Dict[str, tuple[float, dict]] = {}
-        unkeyed_entries = []
-        for sort_score, entry in scored_entries:
-            uri = entry.get("uri", "")
-            if not uri:
-                unkeyed_entries.append((sort_score, entry))
-                continue
-            current = best_by_uri.get(uri)
-            if current is None or sort_score > current[0]:
-                best_by_uri[uri] = (sort_score, entry)
-
-        scored_entries = list(best_by_uri.values()) + unkeyed_entries
-        scored_entries.sort(key=lambda x: x[0], reverse=True)
-        limit = args.get("limit")
-        if isinstance(limit, int) and not isinstance(limit, bool) and limit > 0:
-            scored_entries = scored_entries[:limit]
-        formatted = [entry for _, entry in scored_entries]
-
-        return json.dumps({
-            "results": formatted,
-            "total": len(formatted),
-        }, ensure_ascii=False)
+        formatted = [entry for _, entry in sorted(scored_entries, key=lambda x: x[0], reverse=True)]
+        return json.dumps({"results": formatted, "total": result.get("total", len(formatted))}, ensure_ascii=False)
 
     def _read_uri_payload(self, uri: str, level: str, *, limit: Optional[int] = None) -> Dict[str, Any]:
         summary_level = level in {"abstract", "overview"}
@@ -2704,55 +2592,44 @@ class OpenVikingMemoryProvider(MemoryProvider):
         return json.dumps(result, ensure_ascii=False)
 
     def _tool_remember(self, args: dict) -> str:
+        """Submit content through a dedicated session so it never touches the live Hermes session."""
         content = args.get("content", "")
         if not content:
             return tool_error("content is required")
-
-        category = args.get("category") or "pattern"
-        subdir = _CATEGORY_SUBDIR_MAP.get(category, _DEFAULT_MEMORY_SUBDIR)
-        metadata = args.get("metadata") or {}
-        if not isinstance(metadata, dict):
-            return tool_error("metadata must be an object")
-
-        metadata = dict(metadata)
-        if category == "preference":
-            metadata.setdefault("user", self._user or "user")
-        required = _CATEGORY_REQUIRED_METADATA.get(category, ())
-        missing = [
-            field
-            for field in required
-            if not isinstance(metadata.get(field), str) or not metadata[field].strip()
-        ]
-        if missing:
-            return tool_error(
-                f"category '{category}' requires metadata fields: {', '.join(missing)}"
-            )
-
         client = self._ensure_client()
         if not client:
             return tool_error("OpenViking server not connected")
-        uri = self._build_memory_uri(subdir, client=client)
-        serialized_content = _serialize_memory_fields(content, subdir, metadata)
 
-        # Write directly via content/write API.
-        # This creates the file, stores the content, and queues vector indexing
-        # in a single call — no dependency on session commit / VLM extraction.
+        session_id = f"hermes-remember-{uuid.uuid4().hex[:12]}"
+        session_uri = f"viking://user/{self._user_space(client)}/sessions/{session_id}"
+
+        def failure(message: str, *, stage: str, message_status: str) -> str:
+            return tool_error(
+                message, session_id=session_id, session_uri=session_uri, failure_stage=stage, message_status=message_status,
+                recovery_command=f"ov session commit {session_id}",
+                recovery_note=(
+                    "Inspect session_uri before recovery. If history/archive_* exists, do not retry. If messages.jsonl contains "
+                    "the fact and no archive exists, run recovery_command with the same OpenViking profile and credentials as "
+                    "Hermes. Otherwise, do not resubmit automatically; report the uncertain state to the user."
+                ),
+            )
         try:
-            result = client.post("/api/v1/content/write", {
-                "uri": uri,
-                "content": serialized_content,
-                "mode": "create",
-            })
-            written = result.get("result", {}).get("written_bytes", 0)
-            return json.dumps({
-                "status": "stored",
-                "message": f"Memory stored ({written}b) and queued for vector indexing.",
-                "uri": uri,
-                "category": category,
-            })
+            client.post(f"/api/v1/sessions/{session_id}/messages", {"role": "user", "parts": [{"type": "text", "text": content}]})
         except Exception as e:
-            logger.error("OpenViking content/write failed: %s", e)
-            return tool_error(f"Failed to store memory: {e}")
+            logger.error("OpenViking remember message failed for %s: %s", session_id, e)
+            return failure(f"Memory message submission failed for session {session_id}: {e}", stage="message", message_status="unknown")
+        try:
+            commit = self._unwrap_result(client.post(f"/api/v1/sessions/{session_id}/commit", {"keep_recent_count": 0}))
+        except Exception as e:
+            logger.error("OpenViking remember commit failed for %s: %s", session_id, e)
+            return failure(f"Memory message was accepted, but commit failed for session {session_id}: {e}", stage="commit", message_status="accepted")
+        commit = commit if isinstance(commit, dict) else {}
+        return json.dumps({
+            "status": "submitted", "session_id": session_id, "session_uri": session_uri, "message_status": "accepted",
+            "extraction_status": str(commit.get("status") or "accepted"),
+            "message": "Memory source submitted to OpenViking session extraction. OpenViking may add, merge, or skip the final memory.",
+            **{key: commit[key] for key in ("task_id", "trace_id") if commit.get(key)},
+        })
 
     def _tool_forget(self, args: dict) -> str:
         uri, error = _validate_forget_memory_uri(args.get("uri"))
@@ -2805,27 +2682,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 payload["temp_file_id"] = self._client.upload_temp_file(cleanup_path or source_path)
             else:
                 return tool_error(f"Unsupported local resource path: {url}")
-
-            if payload.get("wait"):
-                requested_timeout = payload.get("timeout", _RESOURCE_WAIT_TIMEOUT)
-                try:
-                    requested_timeout = float(requested_timeout)
-                except (TypeError, ValueError):
-                    requested_timeout = _RESOURCE_WAIT_TIMEOUT
-                if requested_timeout <= 0:
-                    requested_timeout = _RESOURCE_WAIT_TIMEOUT
-                http_timeout = max(
-                    _TIMEOUT,
-                    requested_timeout + _RESOURCE_WAIT_RESPONSE_MARGIN,
-                )
-                resp = self._client.post(
-                    "/api/v1/resources",
-                    payload,
-                    timeout=http_timeout,
-                )
-            else:
-                resp = self._client.post("/api/v1/resources", payload)
-            result = resp.get("result", {})
+            result = self._client.post("/api/v1/resources", payload).get("result", {})
         finally:
             if cleanup_path:
                 cleanup_path.unlink(missing_ok=True)
