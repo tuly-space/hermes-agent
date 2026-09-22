@@ -22,6 +22,26 @@ Make it a **Tool** when:
 - It handles binary data, streaming, or real-time events
 - Examples: browser automation, TTS, vision analysis
 
+## On-demand skill discovery
+
+Skill bodies are loaded only through `skill_view`. By default, their names and
+short descriptions are included in the system prompt. To defer that index too,
+set this in the active profile's `config.yaml`:
+
+```yaml
+skills:
+  prompt_index: false
+```
+
+The prompt then contains only a short instruction to discover relevant skills
+with `skills_list` (optionally by category) and load them with `skill_view`.
+This does not disable skills, alter their contents, or change skill permissions.
+The default is `true`; other profiles are unaffected. If either discovery tool
+is unavailable, the normal index remains as a fallback. New prompt builds use
+the setting; it does not rewrite an existing conversation's cached prompt.
+After a runtime code update, already-running gateway processes need a normal
+restart before they can use the new implementation.
+
 ## Skill Directory Structure
 
 Bundled skills live in `skills/` organized by category. Official optional skills use the same structure in `optional-skills/`:

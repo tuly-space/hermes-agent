@@ -2245,6 +2245,9 @@ DEFAULT_CONFIG = {
         # before the agent sees it.  Lets skill authors reference bundled
         # scripts without the agent having to join paths.
         "template_vars": True,
+        # Include skill names/descriptions in the prompt. False keeps only
+        # discovery guidance; skills_list and skill_view remain available.
+        "prompt_index": True,
         # Pre-execute inline shell snippets written as !`cmd` in SKILL.md
         # body.  Their stdout is inlined into the skill message before the
         # agent reads it, so skills can inject dynamic context (dates, git

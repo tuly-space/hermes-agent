@@ -1800,6 +1800,25 @@ def build_skills_system_prompt(
         skills_dir = get_skills_dir()
         _home_token = None
     try:
+        # Resolve after binding the explicit profile home, before index caches
+        # or filesystem scans. Skills remain available through the tools.
+        from hermes_cli.config import cfg_get, load_config_readonly
+
+        config = load_config_readonly()
+        discovery_available = available_tools is None or {
+            "skills_list", "skill_view"
+        }.issubset(available_tools)
+        if cfg_get(config, "skills", "prompt_index", default=True) is False and discovery_available:
+            return (
+                "## Skills\n"
+                "Skill discovery is on demand. Before answering, use skills_list "
+                "(optionally filtered by category) to find relevant skills, then "
+                "skill_view to load and follow the matching skill before acting. "
+                "If its name is already known, call skill_view directly. "
+                "For Hermes topics, load hermes-agent first. "
+                "Load linked references only when relevant.\n"
+            )
+
         external_dirs = get_all_skills_dirs()[1:]  # skip local (index 0)
         # Trusted project-local dirs (./.hermes/skills, ./.agents/skills at
         # the git root) — highest-precedence tier, scanned before local.
