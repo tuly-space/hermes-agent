@@ -12,6 +12,7 @@ href to walk the OAuth flow.
 from __future__ import annotations
 
 import html
+import re
 from urllib.parse import quote, urlencode
 
 from hermes_cli.dashboard_auth import list_session_providers
@@ -284,6 +285,7 @@ _LOGIN_HTML_TEMPLATE = """\
     color: var(--background-base);
   }}
 </style>
+{login_theme_css}
 </head>
 <body>
 <main>
@@ -439,6 +441,24 @@ _PASSWORD_FORM_SCRIPT = """\
 """
 
 
+def _active_login_theme_css() -> str:
+    """Style the separately rendered login page only when the active theme opts in."""
+    try:
+        from hermes_cli.config import cfg_get, load_config
+        from hermes_cli.web_server_dashboard import _discover_user_themes
+
+        active = cfg_get(load_config(), "dashboard", "theme", default="default")
+        for theme in _discover_user_themes():
+            if theme["name"] == active and theme.get("loginCSS"):
+                # Theme CSS is operator-authored; prevent a closing HTML style tag.
+                css = re.sub(r"</style", r"<\/style", theme["loginCSS"], flags=re.I)
+                return f'<style id="hermes-login-theme">\n{css}\n</style>'
+    except Exception:
+        # A malformed theme must never prevent someone from signing in.
+        pass
+    return ""
+
+
 def render_login_html(*, next_path: str = "") -> str:
     """Return the full HTML for ``GET /login``.
 
@@ -463,6 +483,7 @@ def render_login_html(*, next_path: str = "") -> str:
     return _LOGIN_HTML_TEMPLATE.format(
         provider_buttons="\n".join(buttons),
         password_script=_PASSWORD_FORM_SCRIPT if needs_password_script else "",
+        login_theme_css=_active_login_theme_css(),
     )
 
 
@@ -484,7 +505,10 @@ def render_native_provider_choice_html(
                        f'Sign in with {html.escape(p.display_name)}</a>')
     if not buttons:
         return _EMPTY_HTML
-    return _LOGIN_HTML_TEMPLATE.format(provider_buttons="\n".join(buttons), password_script="")
+    return _LOGIN_HTML_TEMPLATE.format(
+        provider_buttons="\n".join(buttons), password_script="",
+        login_theme_css=_active_login_theme_css(),
+    )
 
 
 def _render_password_form(provider, next_path: str) -> str:

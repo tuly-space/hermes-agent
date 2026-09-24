@@ -4183,8 +4183,13 @@ class TestNormaliseThemeDefinition:
         assert result["palette"]["foreground"]["hex"] == "#ffffff"
         assert result["palette"]["foreground"]["alpha"] == 0.0
 
+    def test_login_css_is_opt_in_and_bounded(self):
+        from hermes_cli.web_server_dashboard import _normalise_theme_definition
 
-
+        plain = _normalise_theme_definition({"name": "plain"})
+        assert plain is not None and "loginCSS" not in plain
+        result = _normalise_theme_definition({"name": "with-login", "loginCSS": "a" * 40000})
+        assert result is not None and len(result["loginCSS"]) == 32 * 1024
 
 
 class TestDiscoverUserThemes:

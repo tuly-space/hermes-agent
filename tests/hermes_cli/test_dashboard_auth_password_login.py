@@ -402,3 +402,22 @@ class TestLoginPageRender:
         finally:
             clear_providers()
 
+    def test_active_user_theme_styles_login_without_changing_other_themes(self, monkeypatch):
+        from hermes_cli import config as config_mod, web_server_dashboard as dashboard_mod
+        monkeypatch.setattr(config_mod, "load_config", lambda: {"dashboard": {"theme": "clean-light"}})
+        monkeypatch.setattr(dashboard_mod, "_discover_user_themes", lambda: [
+            {"name": "clean-light", "loginCSS": "body{background:#fff}/* </STYLE><script> */"}
+        ])
+        clear_providers()
+        register_provider(PasswordProvider())
+        try:
+            themed = render_login_html()
+            assert '<style id="hermes-login-theme">' in themed
+            assert "body{background:#fff}" in themed
+            assert "</STYLE><script>" not in themed
+            assert "<\\/style><script>" in themed.lower()
+            monkeypatch.setattr(config_mod, "load_config", lambda: {"dashboard": {"theme": "default"}})
+            assert 'id="hermes-login-theme"' not in render_login_html()
+        finally:
+            clear_providers()
+

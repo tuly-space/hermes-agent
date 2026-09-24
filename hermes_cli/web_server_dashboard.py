@@ -375,6 +375,13 @@ def _normalise_theme_definition(data: Dict[str, Any]) -> Optional[Dict[str, Any]
 
     custom_css_val = data.get("customCSS")
     custom_css = custom_css_val[:_THEME_CUSTOM_CSS_MAX] if _nonempty_str(custom_css_val) else None
+    # The server-rendered login page does not load the SPA's theme CSS.
+    login_css_val = data.get("loginCSS")
+    login_css = (
+        login_css_val[:_THEME_CUSTOM_CSS_MAX]
+        if isinstance(login_css_val, str) and login_css_val.strip()
+        else None
+    )
 
     component_styles: Dict[str, Dict[str, str]] = {}
     for bucket, props in _dict_field(data, "componentStyles").items():
@@ -406,6 +413,8 @@ def _normalise_theme_definition(data: Dict[str, Any]) -> Optional[Dict[str, Any]
         result["assets"] = assets_out
     if custom_css is not None:
         result["customCSS"] = custom_css
+    if login_css is not None:
+        result["loginCSS"] = login_css
     if component_styles:
         result["componentStyles"] = component_styles
     return result
