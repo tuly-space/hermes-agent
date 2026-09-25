@@ -29,9 +29,18 @@ its previous checkpoint/attempt. This floor does not guarantee savings.
 The attempt watermark is durable and the checkpoint is attached to the existing
 assistant row, never replacing searchable raw transcript rows or changing session ID.
 No completed compaction item means failure. Idle never sends its model output as
-chat. New gateway turns invalidate the saved deadline and abort an in-flight idle request; the
-network wait holds no session-turn lease. A short atomic commit checks that no
-foreground turn owns the lease and the message watermark is unchanged.
+chat. A due check for a parent session with a running/finalizing delegation or an
+undelivered (pending) completion is retired without a provider request, start
+notice, or cached-agent eviction. This read-only gate consults that profile's
+durable `state.db` ledger by the parent session ID, not the reusable gateway
+routing key or process-local registry; a ledger read error also skips the pass.
+Delivered or terminally dropped completions no longer block it. There is no
+retry/polling for a skipped deadline: processing a completion as a normal parent
+turn re-arms a full 25-minute delay after that turn, independently of when the
+completion delivery is acknowledged. New gateway turns invalidate the saved
+deadline and abort an in-flight idle request; the network wait holds no
+session-turn lease. A short atomic commit checks that no foreground turn owns
+the lease and the message watermark is unchanged.
 
 For a Discord session originating in a thread, an eligible background pass
 sends one brief start notice to that same thread when native `/responses`

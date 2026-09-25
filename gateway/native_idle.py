@@ -9,7 +9,7 @@ from contextlib import suppress
 from pathlib import Path
 
 from agent.idle_timetable import for_home
-from agent.native_maintenance import _idle_tick, eligible
+from agent.native_maintenance import _idle_tick, eligible, idle_delegation_blocked
 from gateway.session import build_session_context
 
 logger = logging.getLogger("gateway.run")
@@ -217,6 +217,11 @@ def _execute(runner, home, loop, sid, item, cancellation):
                     (db._session_turn_lease_key(sid),))
                 if lease and float(lease["expires_at"]) > time.time():
                     logger.info("Idle check skipped %s: foreground turn lease is active", sid)
+                    return
+                # Retire this due revision before cold construction, notices or provider work.
+                # The common tick repeats the guard for local timers and a later dispatch.
+                if idle_delegation_blocked(db, sid):
+                    logger.info("Idle check skipped %s: delegation active or completion pending", sid)
                     return
                 cache = getattr(runner, "_agent_cache", None)
                 lock = getattr(runner, "_agent_cache_lock", None)

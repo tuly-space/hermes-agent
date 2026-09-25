@@ -1,5 +1,6 @@
 """Native-first maintenance: raw SSE, durable CAS, one-shot idle scheduler."""
 import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -55,6 +56,68 @@ def _events(item=None, status="completed"):
         "status": status, "output": [], "usage": {"input_tokens": 172_000,
         "input_tokens_details": {"cached_tokens": 40_000}, "output_tokens": 450}}})
     return result
+
+
+def _delegation(db, delegation_id, parent, state="running", delivery="pending"):
+    now = time.time()
+    db._write_sql("""INSERT INTO async_delegations
+        (delegation_id, origin_session, parent_session_id, state, dispatched_at,
+         updated_at, delivery_state) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (delegation_id, "reusable-gateway-key", parent, state, now, now, delivery))
+
+
+def test_idle_delegation_guard_uses_durable_parent_and_profile_not_reusable_key(tmp_path):
+    a = SessionDB(db_path=tmp_path / "a" / "state.db")
+    b = SessionDB(db_path=tmp_path / "b" / "state.db")
+    try:
+        for db in (a, b):
+            db.create_session("parent", source="discord")
+        _delegation(a, "other-parent", "replaced-session")
+        _delegation(b, "other-profile", "parent")
+        assert not maintenance.idle_delegation_blocked(a, "parent")
+        for state in ("running", "finalizing", "completed"):
+            delegation_id = f"state-{state}"
+            _delegation(a, delegation_id, "parent", state)
+            # A fresh handle reads the same ledger, not process-local delegation records.
+            restarted = SessionDB(db_path=a.db_path)
+            try:
+                assert maintenance.idle_delegation_blocked(restarted, "parent")
+            finally:
+                restarted.close()
+            a._write_sql("UPDATE async_delegations SET delivery_state='delivered' WHERE delegation_id=?",
+                         (delegation_id,))
+            assert maintenance.idle_delegation_blocked(a, "parent") is (state != "completed")
+            a._write_sql("DELETE FROM async_delegations WHERE delegation_id=?", (delegation_id,))
+        _delegation(a, "done", "parent", "completed", "dropped")
+        assert not maintenance.idle_delegation_blocked(a, "parent")
+        assert maintenance.idle_delegation_blocked(b, "parent")
+    finally:
+        a.close()
+        b.close()
+
+
+def test_local_idle_tick_skips_pending_delivery_and_failed_ledger_without_provider(monkeypatch, session):
+    agent, _ = _agent(session, [])
+    agent._native_idle_cancel = threading.Event()
+    agent._native_idle_handle = object()
+    agent.compression_native_idle_after_seconds = 1500
+    provider = Mock()
+    monkeypatch.setattr(maintenance, "attempt", provider)
+    notice = Mock()
+    agent._native_idle_start_callback = notice
+    _delegation(session, "pending-completion", agent.session_id, "completed")
+    assert maintenance._idle_tick(agent, agent.session_id) is False
+    session._write_sql("UPDATE async_delegations SET delivery_state='delivered' WHERE delegation_id='pending-completion'")
+    original = session._read_one
+    def unavailable(sql, params=()):
+        if "FROM async_delegations" in sql:
+            raise OSError("ledger unavailable")
+        return original(sql, params)
+    monkeypatch.setattr(session, "_read_one", unavailable)
+    assert maintenance._idle_tick(agent, agent.session_id) is False
+    provider.assert_not_called()
+    notice.assert_not_called()
+    assert session.get_session_model_config_value(agent.session_id, maintenance._IDLE_KEY, None) is None
 
 
 def _run(monkeypatch, agent, db):

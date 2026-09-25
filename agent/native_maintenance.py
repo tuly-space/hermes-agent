@@ -285,6 +285,18 @@ def _idle_pressure(agent: Any, messages: list[dict]) -> int:
     return _preflight_request_tokens(agent, messages, getattr(agent, "_cached_system_prompt", "") or "")
 
 
+def idle_delegation_blocked(db: Any, sid: str) -> bool:
+    """Fail closed on this profile's durable parent ownership, including unacknowledged results."""
+    try:
+        return db._read_one("""SELECT 1 FROM async_delegations
+            WHERE parent_session_id = ?
+              AND (state IN ('running', 'finalizing') OR delivery_state = 'pending')
+            LIMIT 1""", (sid,)) is not None
+    except Exception:
+        logger.warning("Idle delegation ledger unavailable for session=%s; skipping", sid, exc_info=True)
+        return True
+
+
 def arm_idle(agent: Any, result: Any) -> None:
     """Persist gateway turns; retain the local timer for non-gateway agents."""
     seconds = getattr(agent, "compression_native_idle_after_seconds", 0)
@@ -343,6 +355,8 @@ def _idle_tick(agent: Any, sid: str, generation: threading.Event | None = None) 
     if (generation is None or generation.is_set() or generation is not getattr(agent, "_native_idle_cancel", None)
             or db is None or sid != getattr(agent, "session_id", None) or not eligible(agent)
             or getattr(agent, "compression_native_idle_after_seconds", 0) <= 0):
+        return False
+    if idle_delegation_blocked(db, sid):
         return False
     try:
         if (sid != getattr(agent, "session_id", None)

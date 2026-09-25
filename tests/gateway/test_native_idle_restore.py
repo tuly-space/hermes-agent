@@ -10,6 +10,7 @@ from unittest.mock import Mock
 import pytest
 
 from agent.idle_timetable import IdleTimetable
+from agent.native_maintenance import idle_delegation_blocked
 from agent.usage_anchor import capture_usage_anchor
 from gateway.config import GatewayConfig, Platform
 from gateway.session import SessionSource, SessionStore
@@ -22,7 +23,10 @@ from run_agent import AIAgent
 @pytest.mark.asyncio
 @pytest.mark.parametrize("case", ["success", "fallback_success", "persist_failure", "fresh_activity",
                                   "tick_false", "tick_raise", "completion_send_failure",
-                                  "completion_schedule_failure", "postcommit_cancel"])
+                                  "completion_schedule_failure", "postcommit_cancel",
+                                  "delegation_running", "delegation_finalizing", "completion_pending",
+                                  "completion_delivered", "completion_dropped", "other_parent",
+                                  "ledger_unavailable"])
 async def test_restored_missing_prompt_reaches_fake_provider_and_retires(tmp_path, monkeypatch, case):
     home = tmp_path / "profile"
     home.mkdir()
@@ -149,24 +153,58 @@ async def test_restored_missing_prompt_reaches_fake_provider_and_retires(tmp_pat
                     raise RuntimeError("loop cannot schedule")
                 return make_notice(source, adapter, loop, home, text, muted=muted)
             monkeypatch.setattr(native_idle, "_native_idle_thread_notice_callback", cannot_schedule)
+        if case in {"delegation_running", "delegation_finalizing", "completion_pending",
+                    "completion_delivered", "completion_dropped", "other_parent"}:
+            state = {"delegation_running": "running", "delegation_finalizing": "finalizing",
+                     "completion_pending": "completed", "completion_delivered": "completed",
+                     "completion_dropped": "completed", "other_parent": "running"}[case]
+            delivery = {"completion_delivered": "delivered", "completion_dropped": "dropped"}.get(case, "pending")
+            now = time.time()
+            db._write_sql("""INSERT INTO async_delegations
+                (delegation_id, origin_session, parent_session_id, state, dispatched_at,
+                 updated_at, delivery_state) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                ("blocked-unit", entry.session_key,
+                 "replaced-session" if case == "other_parent" else entry.session_id,
+                 state, now, now, delivery))
+            assert idle_delegation_blocked(db, entry.session_id) is (case not in {
+                "completion_delivered", "completion_dropped", "other_parent"})
+        if case == "ledger_unavailable":
+            original_read = SessionDB._read_one
+            def unavailable(self, sql, params=()):
+                if "FROM async_delegations" in sql:
+                    raise OSError("ledger read failed")
+                return original_read(self, sql, params)
+            monkeypatch.setattr(SessionDB, "_read_one", unavailable)
+        cold_resume = Mock(wraps=native_idle._build_agent)
+        monkeypatch.setattr(native_idle, "_build_agent", cold_resume)
         loop = asyncio.get_running_loop()
         restored.start(lambda sid, item, cancelled: native_idle._execute(runner, home, loop, sid, item, cancelled))
+        skipped = case in {"fresh_activity", "delegation_running", "delegation_finalizing",
+                           "completion_pending", "ledger_unavailable"}
         async def finished():
-            expected_sends = 0 if case == "fresh_activity" else (1 if case in (
+            expected_sends = 0 if skipped else (1 if case in (
                 "persist_failure", "tick_false", "tick_raise", "completion_schedule_failure",
                 "postcommit_cancel") else 2)
             while (entry.session_id in restored._entries
-                   or (case not in ("fresh_activity", "tick_false", "tick_raise") and not fake_wire)
+                   or restored._worker_count
+                   or (not skipped and case not in ("tick_false", "tick_raise") and not fake_wire)
                    or len(sends) < expected_sends):
                 await asyncio.sleep(.02)
         await asyncio.wait_for(finished(), timeout=10)
-        if case in ("fresh_activity", "tick_false", "tick_raise"):
+        if skipped or case in ("tick_false", "tick_raise"):
             assert not fake_wire
-            assert len(sends) == (0 if case == "fresh_activity" else 1)
+            assert len(sends) == (0 if skipped else 1)
             assert all("上下文压缩已完成" not in notice[1] for notice in sends)
             assert runner._agent_cache[entry.session_key][0] is original
             assert not db.get_messages_as_conversation(entry.session_id)[-1].get("codex_reasoning_items")
             assert db.get_session(entry.session_id)["end_reason"] is None
+            assert entry.session_id not in IdleTimetable(table.path)._read()["entries"]
+            if skipped and case != "fresh_activity":
+                cold_resume.assert_not_called()
+            if case == "completion_pending":
+                assert idle_delegation_blocked(db, entry.session_id)
+            assert restored._worker_count == 0
+            assert restored.waits < 20  # no overdue-revision redispatch loop
             restored.stop()
             return
         assert "Gateway context for this thread" in fake_wire[0]["instructions"]
@@ -209,6 +247,13 @@ async def test_restored_missing_prompt_reaches_fake_provider_and_retires(tmp_pat
         # user turn with the persisted capsule rather than a blank/new session.
         fresh = native_idle._build_agent(runner, db, entry, source, db.get_session(entry.session_id))
         assert fresh is not None
+        # A completion can still be pending when the parent's normal turn ends.
+        # Do not let delivery acknowledgement delay or erase that turn's full timer.
+        now = time.time()
+        db._write_sql("""INSERT INTO async_delegations
+            (delegation_id, origin_session, parent_session_id, state, dispatched_at,
+             updated_at, delivery_state) VALUES (?, ?, ?, 'completed', ?, ?, 'pending')""",
+            ("finishing-unit", entry.session_key, entry.session_id, now, now))
         def dispatch_to_fake_provider(wire):
             followup_wire.append(wire)
             return NS(output=[NS(type="message", content=[NS(type="output_text",
@@ -221,6 +266,13 @@ async def test_restored_missing_prompt_reaches_fake_provider_and_retires(tmp_pat
             result = await asyncio.to_thread(
                 fresh.run_conversation, "Next user message", conversation_history=db.get_messages_as_conversation(entry.session_id))
             assert result["final_response"] == "Continued with context."
+            rearmed = IdleTimetable(table.path)._read()["entries"][entry.session_id]
+            assert rearmed["delay"] == 1
+            assert rearmed["idle_at"] >= now
+            assert idle_delegation_blocked(db, entry.session_id)
+            db._write_sql("UPDATE async_delegations SET delivery_state='delivered' WHERE delegation_id='finishing-unit'")
+            assert not idle_delegation_blocked(db, entry.session_id)
+            assert IdleTimetable(table.path)._read()["entries"][entry.session_id] == rearmed
             assert followup_wire
             assert any(item.get("type") == "compaction" and
                        item.get("encrypted_content") == "opaque-test-checkpoint"
