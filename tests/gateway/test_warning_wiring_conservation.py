@@ -22,6 +22,7 @@ def test_actual_wiring_retains_observers_and_controls_across_muted_turn():
             _merge_turn_request_overrides=TurnRunner._merge_turn_request_overrides,
             _clarify_callback_sync=lambda *a: "yes",
             _notice_callback_sync=lambda *a: observed.append(("notice", a)),
+            _make_native_idle_start_callback=lambda: None,
             _attach_session_title_callback=lambda *a: None)
         agent = StatusOutputMixin()
         agent.suppress_status_output = True

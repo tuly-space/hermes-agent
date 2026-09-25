@@ -54,7 +54,8 @@ def _usage(usage: Any) -> tuple[Any, Any, Any]:
 
 def attempt(agent: Any, messages: list[dict], system_prompt: str, before_tokens: int,
             *, phase: str, expected_watermark: int | None = None,
-            turn_lease_holder: str | None = None, commit_fence: Any = None) -> bool:
+            turn_lease_holder: str | None = None, commit_fence: Any = None,
+            on_idle_start: Any = None) -> bool:
     """Try a forced inline /responses checkpoint; return False for *any* non-commit.
 
     A maintenance request must not use /responses/compact (404 on Codex OAuth).
@@ -153,6 +154,8 @@ def attempt(agent: Any, messages: list[dict], system_prompt: str, before_tokens:
                 reason = "new_turn_or_shutdown"
                 agent._native_maintenance_abort_fallback = True
                 return False
+            if on_idle_start is not None:
+                on_idle_start()
         stream = client.responses.create(**bypass_sdk_request_transform(kwargs))
         terminal_seen = False
         def _terminal_event(event):
@@ -349,14 +352,31 @@ def _idle_tick(agent: Any, sid: str, generation: threading.Event | None = None) 
         from agent.conversation_compression import CompressionCommitFence
         fence = CompressionCommitFence(total_ceiling_seconds=300)
         agent._native_idle_fence = fence
+        # A single admission notice per pass, shared by native and summary fallback.
+        # Capture the gateway's destination before any later turn rebinds the cached agent.
+        notify = getattr(agent, "_native_idle_start_callback", None)
+        notified = False
+        def on_idle_start():
+            nonlocal notified
+            if (notified or generation.is_set()
+                    or generation is not getattr(agent, "_native_idle_cancel", None)):
+                return
+            notified = True
+            if callable(notify):
+                try:
+                    notify()
+                except Exception:
+                    logger.debug("Native idle start notice failed: session=%s", sid, exc_info=True)
         try:
             ok = attempt(agent, messages, getattr(agent, "_cached_system_prompt", "") or "", pressure,
-                         phase="idle", expected_watermark=watermark, commit_fence=fence)
+                         phase="idle", expected_watermark=watermark, commit_fence=fence,
+                         on_idle_start=on_idle_start)
         finally:
             if getattr(agent, "_native_idle_fence", None) is fence:
                 agent._native_idle_fence = None
         if not ok and not getattr(agent, "_native_maintenance_abort_fallback", False) and not generation.is_set():
-            _ordinary_idle_fallback(agent, messages, sid, watermark, generation, pressure)
+            _ordinary_idle_fallback(agent, messages, sid, watermark, generation, pressure,
+                                    on_idle_start=on_idle_start)
         return False
     except Exception:
         logger.warning("Native idle maintenance declined for session=%s", sid, exc_info=True)
@@ -364,7 +384,7 @@ def _idle_tick(agent: Any, sid: str, generation: threading.Event | None = None) 
 
 
 def _ordinary_idle_fallback(agent: Any, messages: list[dict], sid: str, watermark: int,
-                            generation: threading.Event, pressure: int) -> bool:
+                            generation: threading.Event, pressure: int, *, on_idle_start: Any = None) -> bool:
     """Use the existing in-place compressor, never rotate or publish a stale idle result."""
     db = agent._session_db
     if (generation.is_set() or generation is not getattr(agent, "_native_idle_cancel", None)
@@ -381,6 +401,8 @@ def _ordinary_idle_fallback(agent: Any, messages: list[dict], sid: str, watermar
         # transactional exact-watermark + turn-lease guard fences the commit.
         if generation.is_set() or generation is not getattr(agent, "_native_idle_cancel", None):
             return False
+        if on_idle_start is not None:
+            on_idle_start()
         compressed, _ = agent._compress_context(
             messages, getattr(agent, "_cached_system_prompt", "") or "",
             approx_tokens=pressure, commit_fence=fence, force=True,

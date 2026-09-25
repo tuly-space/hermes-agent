@@ -27,6 +27,16 @@ chat. New user turns cancel the timer and abort an in-flight idle request; the
 network wait holds no session-turn lease. A short atomic commit checks that no
 foreground turn owns the lease and the message watermark is unchanged.
 
+For a Discord session originating in a thread, an eligible background pass
+sends one brief start notice to that same thread when native `/responses`
+maintenance begins (or when ordinary summary fallback actually starts if the
+native request could not begin). This is independent of routine
+`compression.progress_notices`. Skipped, below-floor, stale or pre-start
+cancelled timers stay silent. A failed native attempt followed by summary
+fallback does not send a second notice. The notice does not claim completion,
+does not create a session message, and delivery failure does not stop
+compression. Channel/DM sessions and other platforms receive no notice.
+
 Maintenance logs distinguish full-request *rough before* pressure from actual
 maintenance request `usage_input/usage_cached/usage_output`; after-checkpoint
 input remains unknown until an ordinary provider response reports it. Opaque
