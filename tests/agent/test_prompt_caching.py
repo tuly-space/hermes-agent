@@ -422,25 +422,49 @@ class TestNormalizationOrdering:
 
         assert in_window == out_of_window
 
-    def test_cache_marking_runs_after_every_message_mutation(self):
-        """Ordering invariant, locked against regression."""
-        import inspect
-
+    def test_cache_marking_runs_after_every_message_mutation(self, monkeypatch):
+        """Cache planning observes normalized copies, never dirty history."""
+        import copy
+        import logging
+        import pytest
         from agent import turn_request_assembly
+        from run_agent import AIAgent
 
-        src = inspect.getsource(turn_request_assembly)
-        # Anchor on the call-block request plan, not the retry helper.
-        anchor = src.index("Build the request-local cache sections")
-        mark = src.index("build_prompt_cache_plan(\n", anchor)
-        for earlier in (
-            'am["content"].strip()',              # whitespace normalization
-            "_sanitize_api_messages(api_messages)",       # orphan sweep
-            "_drop_thinking_only_and_merge_users(",       # drop / merge
-            "_sanitize_messages_surrogates(api_messages)",
-        ):
-            assert src.index(earlier) < mark, (
-                f"{earlier!r} must run before cache breakpoints are injected"
-            )
+        agent = AIAgent(api_key="test-key", base_url="https://api.openai.com/v1",
+                        provider="openai-api", model="gpt-5.6", quiet_mode=True,
+                        skip_context_files=True, skip_memory=True, enabled_toolsets=[])
+        agent._use_prompt_caching = True
+        agent._current_turn_timestamp = 0
+        history = [
+            {"role": "user", "content": "  question \ud800  "},
+            {"role": "assistant", "content": "  checking  ", "tool_calls": [{
+                "id": "call1", "type": "function", "function": {
+                    "name": "read", "arguments": '{ "a": 1 }'}}]},
+            {"role": "tool", "tool_call_id": "call1", "content": "  result  "},
+        ]
+        before = copy.deepcopy(history)
+        class PlanObserved(Exception):
+            pass
+        def observe(messages, tools, **kwargs):
+            for message in messages:
+                content = message.get("content")
+                if isinstance(content, str):
+                    assert content == content.strip()
+                    assert not any(0xD800 <= ord(ch) <= 0xDFFF for ch in content)
+            tool_call = next(m for m in messages if m.get("tool_calls"))["tool_calls"][0]
+            assert tool_call["function"]["arguments"] == '{"a":1}'
+            raise PlanObserved
+        monkeypatch.setattr(turn_request_assembly, "build_prompt_cache_plan", observe)
+        try:
+            with pytest.raises(PlanObserved):
+                turn_request_assembly.assemble_api_request(
+                    agent, messages=history, current_turn_user_idx=-1,
+                    _ext_prefetch_cache="", _plugin_user_context="", moa_config=None,
+                    active_system_prompt="frozen", original_user_message="question",
+                    pending_moa_prepared_request=None, request_logger=logging.getLogger(__name__))
+            assert history == before
+        finally:
+            agent.close()
 
 
 class TestStripAnthropicCacheControl:

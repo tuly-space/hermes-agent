@@ -82,7 +82,8 @@ def attempt(agent: Any, messages: list[dict], system_prompt: str, before_tokens:
         durable = db.get_messages_as_conversation(sid, repair_alternation=True, include_row_ids=True)
         if (len(plain) != len(durable) or not durable
                 or durable[-1].get("_row_id") != expected_watermark
-                or any(m.get("role") != d.get("role") or m.get("content") != d.get("content")
+                or any(m.get("role") != d.get("role")
+                       or db._loaded_view_content(m.get("role"), m.get("content")) != d.get("content")
                        or m.get("tool_calls") != d.get("tool_calls") for m, d in zip(plain, durable))):
             agent._native_maintenance_abort_fallback = True
             return False

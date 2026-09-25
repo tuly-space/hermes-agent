@@ -456,6 +456,9 @@ def test_maintenance_uses_send_transforms_for_digest_and_tool_boundary(session, 
     monkeypatch.setattr(agent, "_close_request_openai_client", lambda *a, **kw: None)
     try:
         rows = session.get_messages_as_conversation("same-session", include_row_ids=True)
+        # Freshly flushed in-memory text keeps whitespace that DB replay strips.
+        # It is still the same durable prefix and must get a native attempt.
+        rows[0]["content"] = "  " + rows[0]["content"] + "  "
         assert maintenance.attempt(agent, rows, "frozen", 100_000, phase="threshold",
                                    expected_watermark=session.get_active_message_watermark("same-session"))
         wire = client.responses.create.call_args.kwargs["extra_body"]["input"]
