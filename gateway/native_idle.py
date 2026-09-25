@@ -290,6 +290,10 @@ def bootstrap(runner, loop) -> list[tuple[Path, int]]:
                 table.start(lambda sid, item, cancelled, h=home: _execute(
                     runner, h, loop, sid, item, cancelled))
                 restored.append((home, count))
+                with table._condition:
+                    pending = len(table._entries)
+                logger.info("Idle timetable loaded: profile=%s backfilled=%d pending=%d workers=%d",
+                            home.name, count, pending, table.workers)
         except Exception:
             logger.warning("Idle timetable unavailable for profile %s (no history rescan on corrupt file)",
                            home, exc_info=True)
