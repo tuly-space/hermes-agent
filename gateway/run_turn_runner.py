@@ -1190,49 +1190,12 @@ class TurnRunner:
                             user_config=self._ctx.user_config, diagnostic=diagnostic)
 
     def _make_native_idle_start_callback(self):
-        """Pin the originating Discord transport/thread beyond the lifetime of this turn.
-
-        Unlike status callbacks, idle maintenance runs after turn_done; don't capture
-        TurnContext, a generation predicate, or the whole runner in this closure.
-        """
-        ctx = self._ctx
-        source = ctx.source
-        adapter = ctx._status_adapter
-        thread_id = str(getattr(source, "thread_id", "") or "")
-        if (getattr(source, "platform", None) != Platform.DISCORD or not thread_id
-                or adapter is None or ctx.mute_notification_reply):
-            return None
-        from agent.async_utils import safe_schedule_threadsafe
-        from gateway.run import _async_profile_runtime_scope, _interim_metadata, _non_conversational_metadata
+        """Capture the exact transport/thread, without retaining the turn runner."""
+        from gateway.native_idle import native_idle_start_callback
         from hermes_constants import get_hermes_home
-        loop = ctx._loop_for_step
-        profile_home = get_hermes_home()  # bound to the turn's owner; not the launch profile
-        metadata = _interim_metadata(_non_conversational_metadata(
-            {"thread_id": thread_id}, platform=Platform.DISCORD))
-
-        async def send_start():
-            try:
-                # Discord's non-conversational ID tracker and adapter gates read
-                # profile state even when no agent turn is on the stack.
-                async with asyncio.timeout(10):
-                    async with _async_profile_runtime_scope(profile_home):
-                        result = await adapter.send(
-                            thread_id, "正在后台压缩此帖的上下文，原始记录会保留。", metadata=metadata)
-                if not getattr(result, "success", False):
-                    logger.debug("Discord idle compaction start notice not delivered to thread %s", thread_id)
-            except Exception:
-                logger.debug("Discord idle compaction start notice failed for thread %s", thread_id, exc_info=True)
-
-        def notify():
-            future = safe_schedule_threadsafe(
-                send_start(), loop, logger=logger, log_message="Idle compaction notice scheduling error")
-            if future is not None:
-                def observe(done):
-                    with suppress(Exception):
-                        done.result()
-                future.add_done_callback(observe)
-
-        return notify
+        ctx = self._ctx
+        return native_idle_start_callback(ctx.source, ctx._status_adapter, ctx._loop_for_step,
+                                          get_hermes_home(), muted=ctx.mute_notification_reply)
 
     def _make_bg_review_callbacks(self):
         """(send, release): background-review messages ("💾 Memory updated") are held until the

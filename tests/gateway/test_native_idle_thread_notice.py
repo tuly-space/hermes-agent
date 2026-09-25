@@ -66,11 +66,21 @@ def prepared(tmp_path, monkeypatch):
     agent.compression_native_idle_after_seconds = 1
     agent.compression_native_idle_min_tokens = 80_000
     agent.compression_in_place = True
+    setattr(agent, "_gateway_session_key", "test-thread-key")
     agent._cached_system_prompt = "Frozen"
     monkeypatch.setattr(maintenance, "_idle_pressure", lambda *args: 80_000)
-    from agent import periodic_scheduler
+    from agent import idle_timetable
     timers = []
-    monkeypatch.setattr(periodic_scheduler, "schedule", lambda fn, seconds: timers.append(fn) or Mock())
+    class ManualTable:
+        def update(self, *args):
+            agent._native_idle_handle = True
+            timers.append(lambda: maintenance._idle_tick(agent, agent.session_id, agent._native_idle_cancel))
+            return "revision"
+        def cancel(self, sid):
+            agent._native_idle_cancel.set()
+    # Manual delivery tests control the scheduler; file/heap semantics have their own tests.
+    monkeypatch.setattr(idle_timetable, "for_home", lambda *_: ManualTable())
+    agent._native_idle_cancel = threading.Event()
     yield agent, db, timers
     agent.close()
     db.close()

@@ -1394,6 +1394,11 @@ class GatewayStartupMixin:
         # auto-resume stays visible on the next user message.
         self._schedule_resume_pending_sessions()
         await self._finish_startup_restore()
+        # Adapters are ready; migration reads canonical active bindings off-loop.
+        # Do not delay the gateway's availability on an older profile's large DB.
+        from gateway.native_idle import bootstrap as bootstrap_native_idle
+        self._retain_background_task(asyncio.create_task(
+            asyncio.to_thread(bootstrap_native_idle, self, asyncio.get_running_loop())))
         # Surface state.db init failures to messaging platforms before the user loses data.
         # See #88235.
         await self._send_session_db_warning_notifications()

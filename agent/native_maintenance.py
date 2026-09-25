@@ -286,22 +286,40 @@ def _idle_pressure(agent: Any, messages: list[dict]) -> int:
 
 
 def arm_idle(agent: Any, result: Any) -> None:
-    """Arm one timer at the END of a successful turn, never at the next turn."""
-    cancel_idle(agent)
+    """Persist gateway turns; retain the local timer for non-gateway agents."""
     seconds = getattr(agent, "compression_native_idle_after_seconds", 0)
     db, sid = getattr(agent, "_session_db", None), getattr(agent, "session_id", None)
     if (not seconds or not eligible(agent) or db is None or not sid
             or getattr(agent, "_persist_disabled", False)
             or not isinstance(result, dict) or not result.get("completed")):
         return
-    from agent.periodic_scheduler import schedule
-    generation = threading.Event()
-    agent._native_idle_cancel = generation
-    handle = schedule(lambda: _idle_tick(agent, sid, generation), seconds)
-    agent._native_idle_handle = handle
+    key = str(getattr(agent, "_gateway_session_key", None) or "")
+    if not key:
+        from agent.periodic_scheduler import schedule
+        cancel_idle(agent, timetable=False)
+        generation = threading.Event()
+        agent._native_idle_cancel = generation
+        agent._native_idle_handle = schedule(lambda: _idle_tick(agent, sid, generation), seconds)
+        return
+    from agent.idle_timetable import for_home
+    from pathlib import Path
+    for_home(Path(db.db_path).parent).update(sid, key, time.time(), seconds)
 
 
-def cancel_idle(agent: Any) -> None:
+def cancel_idle(agent: Any, *, timetable: bool = True) -> None:
+    if (timetable and getattr(agent, "_gateway_session_key", None)
+            and getattr(agent, "compression_native_idle_after_seconds", 0) > 0
+            and eligible(agent)
+            and not getattr(agent, "_native_idle_owned_by_scheduler", False)
+            and getattr(agent, "session_id", None) and getattr(agent, "_session_db", None)):
+        from pathlib import Path
+        from agent.idle_timetable import for_home
+        try:
+            for_home(Path(agent._session_db.db_path).parent).cancel(agent.session_id)
+        except Exception:
+            # A corrupt/full timetable must never prevent the foreground turn;
+            # the DB watermark/lease still fences a late idle commit.
+            logger.warning("Could not invalidate idle timetable for %s", agent.session_id, exc_info=True)
     cancellation = getattr(agent, "_native_idle_cancel", None)
     if cancellation is not None:
         cancellation.set()
@@ -314,7 +332,7 @@ def cancel_idle(agent: Any) -> None:
         agent._abort_request_openai_client(client, reason="native_idle_superseded")
     handle = getattr(agent, "_native_idle_handle", None)
     agent._native_idle_handle = None
-    if handle is not None:
+    if handle is not None and hasattr(handle, "cancel"):
         handle.cancel()
 
 
@@ -375,9 +393,9 @@ def _idle_tick(agent: Any, sid: str, generation: threading.Event | None = None) 
             if getattr(agent, "_native_idle_fence", None) is fence:
                 agent._native_idle_fence = None
         if not ok and not getattr(agent, "_native_maintenance_abort_fallback", False) and not generation.is_set():
-            _ordinary_idle_fallback(agent, messages, sid, watermark, generation, pressure,
-                                    on_idle_start=on_idle_start)
-        return False
+            return _ordinary_idle_fallback(agent, messages, sid, watermark, generation, pressure,
+                                           on_idle_start=on_idle_start)
+        return bool(ok)
     except Exception:
         logger.warning("Native idle maintenance declined for session=%s", sid, exc_info=True)
         return False

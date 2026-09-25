@@ -209,21 +209,20 @@ def test_post_checkpoint_real_usage_rebaselines_idle_growth(session):
         agent.close()
 
 
-def test_cancelled_old_timer_does_not_use_new_generation(monkeypatch, session):
+def test_rearmed_idle_revision_supersedes_old_one(monkeypatch, session):
+    from agent.idle_timetable import IdleTimetable
+    table = IdleTimetable(session.db_path.parent / "idle.json")
+    monkeypatch.setattr("agent.idle_timetable.for_home", lambda *_: table)
     agent, _ = _agent(session, [])
+    agent._gateway_session_key = "session-key"
     agent.compression_native_idle_after_seconds = 1500
-    from agent import periodic_scheduler
-    callbacks = []
-    monkeypatch.setattr(periodic_scheduler, "schedule", lambda fn, interval: callbacks.append(fn) or Mock())
     maintenance.arm_idle(agent, {"completed": True})
+    old = table._entries[agent.session_id]["revision"]
     maintenance.arm_idle(agent, {"completed": True})
-    monkeypatch.setattr(maintenance, "_idle_pressure", lambda *a: 80_000)
-    called = Mock(return_value=True)
-    monkeypatch.setattr(maintenance, "attempt", called)
-    assert callbacks[0]() is False
-    called.assert_not_called()
-    assert callbacks[1]() is False
-    called.assert_called_once()
+    new = table._entries[agent.session_id]["revision"]
+    assert old != new
+    assert not table.remove(agent.session_id, old)
+    assert table._entries[agent.session_id]["revision"] == new
 
 
 @pytest.mark.parametrize("cancel,append", [(True, False), (False, True)])
@@ -286,22 +285,19 @@ def test_stale_watermark_or_active_turn_rejects_checkpoint(session):
         session.release_session_turn_lease("same-session", owner)
 
 
-def test_idle_armed_after_turn_not_next_turn_and_cancelled(monkeypatch, session):
+def test_idle_persisted_after_turn_and_cancelled(monkeypatch, session):
+    from agent.idle_timetable import IdleTimetable
+    table = IdleTimetable(session.db_path.parent / "idle.json")
+    monkeypatch.setattr("agent.idle_timetable.for_home", lambda *_: table)
     agent, _ = _agent(session, [])
+    agent._gateway_session_key = "session-key"
     agent.compression_native_idle_after_seconds = 1500
-    captures = []
-    class Handle:
-        cancelled = False
-        def cancel(self):
-            self.cancelled = True
-    from agent import periodic_scheduler
-    monkeypatch.setattr(periodic_scheduler, "schedule", lambda fn, interval: captures.append((fn, interval)) or Handle())
     maintenance.arm_idle(agent, {"completed": True})
-    assert len(captures) == 1 and captures[0][1] == 1500
-    handle = agent._native_idle_handle
+    item = table._entries[agent.session_id]
+    assert item["delay"] == 1500
+    assert IdleTimetable(table.path)._read()["entries"][agent.session_id] == item
     maintenance.cancel_idle(agent)
-    assert handle.cancelled
-    assert captures[0][0]() is False
+    assert agent.session_id not in table._entries
 
 
 def test_idle_floor_growth_and_opt_in(monkeypatch, session):
@@ -315,7 +311,7 @@ def test_idle_floor_growth_and_opt_in(monkeypatch, session):
     assert maintenance._idle_tick(agent, agent.session_id) is False
     called.assert_not_called()
     monkeypatch.setattr(maintenance, "_idle_pressure", lambda *_: 80_000)
-    assert maintenance._idle_tick(agent, agent.session_id) is False
+    assert maintenance._idle_tick(agent, agent.session_id) is True
     called.assert_called_once()
     assert maintenance._idle_tick(agent, agent.session_id) is False
     called.assert_called_once()  # durable no-growth guard, even after a failed attempt

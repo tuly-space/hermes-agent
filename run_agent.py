@@ -959,7 +959,9 @@ class AIAgent(
         """Release every resource this agent holds (idempotent); each phase is guarded so one failure never
         blocks the rest."""
         from agent.native_maintenance import cancel_idle
-        cancel_idle(self)
+        # A gateway cache/shutdown close releases resources, not the persistent
+        # idle deadline; foreground turn admission owns timetable invalidation.
+        cancel_idle(self, timetable=not bool(getattr(self, "_gateway_session_key", None)))
         # close() is the hard owner boundary; shutdown_memory_provider() is idempotent so gateway pre-calls
         # never double-extract.
         session_messages = getattr(self, "_session_messages", None)

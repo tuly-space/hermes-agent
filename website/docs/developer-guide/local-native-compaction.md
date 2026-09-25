@@ -14,8 +14,14 @@ For a profile that has already enabled `compression.codex_responses_native: true
 `compression.codex_responses_native_first: true` to attempt native `/responses`
 maintenance before automatic local summary compression. Set
 `compression.codex_responses_native_idle_after_seconds: 1500` for a one-shot
-background timer 25 minutes after each completed durable turn. Both new settings
-default to off; keep the older `idle_compact_after_seconds: 0` or that separate
+background check 25 minutes after each completed durable turn. The profile-owned
+idle timetable is an atomic data file: this update backfills currently bound,
+completed idle sessions once; later restarts load the file, preserve original
+deadlines, and never rescan history. A single condition-driven scheduler wakes at
+the next deadline or on a timetable/worker/shutdown event and runs at most two
+compression workers, without per-session gateway timers or a polling backlog.
+Non-gateway sessions retain their existing local timer. Both new
+settings default to off; keep the older `idle_compact_after_seconds: 0` or that separate
 next-turn summary mechanism may also run. Idle maintenance requires ≥80K
 effective full-request input tokens (configurable with
 `compression.codex_responses_native_idle_min_tokens`) and ≥16K growth since
@@ -23,7 +29,7 @@ its previous checkpoint/attempt. This floor does not guarantee savings.
 The attempt watermark is durable and the checkpoint is attached to the existing
 assistant row, never replacing searchable raw transcript rows or changing session ID.
 No completed compaction item means failure. Idle never sends its model output as
-chat. New user turns cancel the timer and abort an in-flight idle request; the
+chat. New gateway turns invalidate the saved deadline and abort an in-flight idle request; the
 network wait holds no session-turn lease. A short atomic commit checks that no
 foreground turn owns the lease and the message watermark is unchanged.
 
@@ -40,6 +46,12 @@ compression. Channel/DM sessions and other platforms receive no notice.
 Maintenance logs distinguish full-request *rough before* pressure from actual
 maintenance request `usage_input/usage_cached/usage_output`; after-checkpoint
 input remains unknown until an ordinary provider response reports it. Opaque
-ciphertext length is not token usage. No restart scan of older sessions is
-performed; timer arming resumes only after a completed turn. A cross-process
-replay proves persistence, not an undocumented checkpoint lifetime guarantee.
+ciphertext length is not token usage. Every new foreground turn invalidates its
+previous idle plan. Its completed turn updates the persistent idle time, while an
+idle worker conditionally removes
+only the version it claimed, even after a failure or below-threshold check. It
+will not retry that session until another completed conversation turn. The worker
+keeps raw history and the logical session intact and releases its own resources.
+Malformed timetable files fail closed rather than triggering a new history scan.
+A cross-process replay proves persistence, not an undocumented checkpoint
+lifetime guarantee.
