@@ -15,11 +15,14 @@ from gateway.config import GatewayConfig, Platform
 from gateway.session import SessionSource, SessionStore
 from gateway import native_idle
 from gateway.run_agent_cache import GatewayAgentCacheMixin
+from hermes_state import SessionDB
 from run_agent import AIAgent
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("case", ["success", "persist_failure", "fresh_activity"])
+@pytest.mark.parametrize("case", ["success", "fallback_success", "persist_failure", "fresh_activity",
+                                  "tick_false", "tick_raise", "completion_send_failure",
+                                  "completion_schedule_failure", "postcommit_cancel"])
 async def test_restored_missing_prompt_reaches_fake_provider_and_retires(tmp_path, monkeypatch, case):
     home = tmp_path / "profile"
     home.mkdir()
@@ -35,6 +38,7 @@ async def test_restored_missing_prompt_reaches_fake_provider_and_retires(tmp_pat
                            chat_type="thread", thread_id="thread-007", user_id="user-1")
     entry = store.get_or_create_session(source)
     db = store._db_for_key(entry.session_key)
+    assert isinstance(db, SessionDB)
     db.append_messages_batch(entry.session_id, [
         {"role": "user", "content": "Saved fact", "timestamp": time.time() - 10},
         {"role": "assistant", "content": "Acknowledged", "timestamp": time.time() - 10}])
@@ -54,7 +58,11 @@ async def test_restored_missing_prompt_reaches_fake_provider_and_retires(tmp_pat
     sends = []
     class Adapter:
         async def send(self, chat_id, text, metadata=None):
-            sends.append((chat_id, text, metadata))
+            committed = db.get_messages_as_conversation(entry.session_id)[-1]
+            sends.append((chat_id, text, metadata,
+                          bool(committed.get("codex_reasoning_items") or committed["content"] == "Acknowledged summary")))
+            if case == "completion_send_failure" and text.startswith("上下文压缩已完成"):
+                raise RuntimeError("Discord send failed")
             return NS(success=True)
     adapter = Adapter()
     runner = NS(session_store=store, config=GatewayConfig(), _running=True,
@@ -78,12 +86,11 @@ async def test_restored_missing_prompt_reaches_fake_provider_and_retires(tmp_pat
         return client
     def _events(kwargs, collected):
         collected.append(kwargs)
-        return iter([
-            {"type": "response.output_item.done", "item": {
-                "type": "compaction", "encrypted_content": "opaque-test-checkpoint"}},
-            {"type": "response.completed", "response": {
-                "status": "completed", "output": [], "usage": {"input_tokens": 100_000}}},
-        ])
+        events = [] if case == "fallback_success" else [{"type": "response.output_item.done", "item": {
+            "type": "compaction", "encrypted_content": "opaque-test-checkpoint"}}]
+        events.append({"type": "response.completed", "response": {
+            "status": "completed", "output": [], "usage": {"input_tokens": 100_000}}})
+        return iter(events)
     monkeypatch.setattr(AIAgent, "_create_request_openai_client", fake_client)
     monkeypatch.setattr(AIAgent, "_close_request_openai_client", lambda *a, **kw: None)
     from agent import idle_timetable
@@ -98,6 +105,11 @@ async def test_restored_missing_prompt_reaches_fake_provider_and_retires(tmp_pat
         monkeypatch.setattr(idle_timetable, "for_home", lambda *_: restored)
         monkeypatch.setattr(native_idle, "for_home", lambda *_: restored)
         original = native_idle._build_agent(runner, db, entry, source, db.get_session(entry.session_id))
+        if case == "fallback_success":
+            monkeypatch.setattr(type(original.context_compressor), "compress", lambda *a, **kw: [
+                {"role": "user", "content": "Summary of saved fact"},
+                {"role": "assistant", "content": "Acknowledged summary"},
+            ])
         original._session_messages = db.get_messages_as_conversation(entry.session_id)
         runner._agent_cache = {entry.session_key: (original, "signature", 2, entry.session_id)}
         runner._agent_cache_lock = threading.Lock()
@@ -112,20 +124,48 @@ async def test_restored_missing_prompt_reaches_fake_provider_and_retires(tmp_pat
                 {"role": "user", "content": "Fresh question"},
                 {"role": "assistant", "content": "Fresh answer"}])
         if case == "persist_failure":
-            from hermes_state import SessionDB
             def refuse(*args, **kwargs):
                 raise OSError("checkpoint storage unavailable")
             monkeypatch.setattr(SessionDB, "attach_native_checkpoint", refuse)
+        if case in ("tick_false", "tick_raise"):
+            def declined(agent, sid, cancellation):
+                agent._native_idle_start_callback()
+                if case == "tick_raise":
+                    raise RuntimeError("maintenance failed")
+                return False
+            monkeypatch.setattr(native_idle, "_idle_tick", declined)
+        if case == "postcommit_cancel":
+            real_tick = native_idle._idle_tick
+            def cancel_after_commit(agent, sid, cancellation):
+                committed = real_tick(agent, sid, cancellation)
+                assert committed
+                cancellation.set()
+                return committed
+            monkeypatch.setattr(native_idle, "_idle_tick", cancel_after_commit)
+        if case == "completion_schedule_failure":
+            make_notice = native_idle._native_idle_thread_notice_callback
+            def cannot_schedule(source, adapter, loop, home, text, *, muted=False):
+                if text.startswith("上下文压缩已完成"):
+                    raise RuntimeError("loop cannot schedule")
+                return make_notice(source, adapter, loop, home, text, muted=muted)
+            monkeypatch.setattr(native_idle, "_native_idle_thread_notice_callback", cannot_schedule)
         loop = asyncio.get_running_loop()
         restored.start(lambda sid, item, cancelled: native_idle._execute(runner, home, loop, sid, item, cancelled))
         async def finished():
-            while entry.session_id in restored._entries or (case != "fresh_activity" and not fake_wire):
+            expected_sends = 0 if case == "fresh_activity" else (1 if case in (
+                "persist_failure", "tick_false", "tick_raise", "completion_schedule_failure",
+                "postcommit_cancel") else 2)
+            while (entry.session_id in restored._entries
+                   or (case not in ("fresh_activity", "tick_false", "tick_raise") and not fake_wire)
+                   or len(sends) < expected_sends):
                 await asyncio.sleep(.02)
         await asyncio.wait_for(finished(), timeout=10)
-        await asyncio.sleep(.05)
-        if case == "fresh_activity":
-            assert not fake_wire and not sends
+        if case in ("fresh_activity", "tick_false", "tick_raise"):
+            assert not fake_wire
+            assert len(sends) == (0 if case == "fresh_activity" else 1)
+            assert all("上下文压缩已完成" not in notice[1] for notice in sends)
             assert runner._agent_cache[entry.session_key][0] is original
+            assert not db.get_messages_as_conversation(entry.session_id)[-1].get("codex_reasoning_items")
             assert db.get_session(entry.session_id)["end_reason"] is None
             restored.stop()
             return
@@ -134,20 +174,33 @@ async def test_restored_missing_prompt_reaches_fake_provider_and_retires(tmp_pat
         assert "Saved workspace context marker" in fake_wire[0]["instructions"]
         assert db.get_session(entry.session_id)["end_reason"] is None
         history_after = db.get_messages_as_conversation(entry.session_id)
+        assert len(history_after) == 2  # adapter notices are not conversation turns
         if case == "persist_failure":
             assert not history_after[-1].get("codex_reasoning_items")
             assert runner._agent_cache[entry.session_key][0] is original
             assert original._session_messages and original._session_messages[0]["content"] == "Saved fact"
         else:
-            assert history_after[-1]["codex_reasoning_items"][-1]["encrypted_content"] == "opaque-test-checkpoint"
+            if case == "fallback_success":
+                assert [row["content"] for row in history_after] == [
+                    "Summary of saved fact", "Acknowledged summary"]
+            else:
+                assert history_after[-1]["codex_reasoning_items"][-1]["encrypted_content"] == "opaque-test-checkpoint"
             assert entry.session_key not in runner._agent_cache
             assert original._session_messages == []
-        assert sends and sends[0][0] == "thread-007"
+        assert sends[0][0] == "thread-007" and "正在后台压缩" in sends[0][1]
         assert sends[0][2]["thread_id"] == "thread-007"
         assert sends[0][2]["_interim_send"] is True
+        if case not in ("persist_failure", "completion_schedule_failure", "postcommit_cancel"):
+            assert len(sends) == 2
+            assert sends[1][0] == "thread-007"
+            assert sends[1][1] == "上下文压缩已完成，下次对话会接续压缩结果。"
+            assert sends[1][2] == sends[0][2]
+            assert sends[1][3] is True  # completion follows persisted checkpoint or summary
+        else:
+            assert len(sends) == 1  # rejected persistence or scheduling cannot claim success
         assert entry.session_id not in IdleTimetable(table.path)._read()["entries"]
         restored.stop()
-        if case == "persist_failure":
+        if case in ("persist_failure", "fallback_success"):
             assert db.get_session(entry.session_id)["end_reason"] is None
             assert any(row["content"] == "Saved fact" for row in db.get_messages(entry.session_id, include_inactive=True))
             return

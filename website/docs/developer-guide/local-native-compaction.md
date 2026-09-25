@@ -39,9 +39,12 @@ maintenance begins (or when ordinary summary fallback actually starts if the
 native request could not begin). This is independent of routine
 `compression.progress_notices`. Skipped, below-floor, stale or pre-start
 cancelled timers stay silent. A failed native attempt followed by summary
-fallback does not send a second notice. The notice does not claim completion,
-does not create a session message, and delivery failure does not stop
-compression. Channel/DM sessions and other platforms receive no notice.
+fallback does not send a second start notice. Once a native checkpoint or
+ordinary fallback is durably committed, the same original Discord thread also
+receives “上下文压缩已完成，下次对话会接续压缩结果。” Failed persistence, cancellation,
+and skipped checks do not receive a completion notice. Neither notice creates a
+session message; delivery failure does not change the committed result.
+Channel/DM sessions and other platforms receive no notice.
 
 Maintenance logs distinguish full-request *rough before* pressure from actual
 maintenance request `usage_input/usage_cached/usage_output`; after-checkpoint

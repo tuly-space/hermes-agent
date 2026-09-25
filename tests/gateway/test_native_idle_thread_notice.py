@@ -195,7 +195,7 @@ async def test_failed_or_slow_send_never_blocks_native_maintenance(prepared, mon
     # Cancel this test's pending fake transport; the production send has a 10s cap.
     await asyncio.sleep(0)
     for task in asyncio.all_tasks():
-        if task is not asyncio.current_task() and task.get_coro().__name__ == "send_start":
+        if task is not asyncio.current_task() and getattr(task.get_coro(), "__name__", None) == "send_notice":
             task.cancel()
     await asyncio.sleep(0)
 
@@ -239,22 +239,29 @@ def test_callback_failure_does_not_block_native_or_repeat_on_summary(prepared, m
 
 
 @pytest.mark.asyncio
-async def test_deferred_notice_restores_origin_profile_a_b_a(prepared, monkeypatch, tmp_path):
+async def test_deferred_notices_restore_origin_profile_a_b_a(prepared, monkeypatch, tmp_path):
+    from gateway.native_idle import _native_idle_thread_notice_callback
     from hermes_constants import get_hermes_home
     agent, _, _ = prepared
     loop = asyncio.get_running_loop()
     homes = [tmp_path / "a", tmp_path / "b", tmp_path / "a"]
     callbacks = []
     seen = []
+    transports = []
     for index, home in enumerate(homes):
         home.mkdir(exist_ok=True)
         monkeypatch.setenv("HERMES_HOME", str(home))
-        adapter, _, channel, _ = _adapter(f"thread-{index}")
+        adapter, _, channel, routes = _adapter(f"thread-{index}")
+        transports.append((adapter, channel, routes, f"thread-{index}"))
         async def record(*, content, reference=None, target=index):
-            seen.append((target, get_hermes_home()))
+            seen.append((target, get_hermes_home(), content))
             return NS(id=f"message-{target}")
         channel.send.side_effect = record
         callbacks.append(_wire(agent, adapter, loop, thread_id=f"thread-{index}"))
+        callbacks.append(_native_idle_thread_notice_callback(
+            SessionSource(platform=Platform.DISCORD, chat_id="parent", chat_type="thread",
+                          thread_id=f"thread-{index}"), adapter, loop, home,
+            "上下文压缩已完成，下次对话会接续压缩结果。"))
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "ambient"))
     for callback in callbacks:
         await asyncio.to_thread(callback)
@@ -262,5 +269,17 @@ async def test_deferred_notice_restores_origin_profile_a_b_a(prepared, monkeypat
         while len(seen) < len(callbacks):
             await asyncio.sleep(0.01)
     await asyncio.wait_for(all_arrived(), timeout=2)
-    assert sorted(seen) == sorted(enumerate(homes))
+    assert sorted((target, home) for target, home, _ in seen) == sorted(
+        (index, home) for index, home in enumerate(homes) for _ in range(2))
+    assert sum(text == "上下文压缩已完成，下次对话会接续压缩结果。" for _, _, text in seen) == len(homes)
+    for adapter, channel, routes, thread_id in transports:
+        assert routes == [thread_id, thread_id]
+        assert channel.send.await_count == 2
+        assert adapter._last_self_message_id.get(thread_id) is None
+    assert _native_idle_thread_notice_callback(
+        SessionSource(platform=Platform.DISCORD, chat_id="dm", chat_type="dm"),
+        transports[0][0], loop, homes[0], "completed") is None
+    assert _native_idle_thread_notice_callback(
+        SessionSource(platform=Platform.TELEGRAM, chat_id="parent", chat_type="thread", thread_id="thread-0"),
+        transports[0][0], loop, homes[0], "completed") is None
     assert get_hermes_home() == tmp_path / "ambient"

@@ -24,7 +24,13 @@ def enabled():
 
 
 def native_idle_start_callback(source, adapter, loop, profile_home, *, muted=False):
-    """One non-conversational notice in the originating Discord thread only."""
+    """One non-conversational start notice in the originating Discord thread."""
+    return _native_idle_thread_notice_callback(
+        source, adapter, loop, profile_home,
+        "正在后台压缩此帖的上下文，原始记录会保留。", muted=muted)
+
+
+def _native_idle_thread_notice_callback(source, adapter, loop, profile_home, text, *, muted=False):
     from gateway.config import Platform
     from agent.async_utils import safe_schedule_threadsafe
     from gateway.run import _async_profile_runtime_scope, _interim_metadata, _non_conversational_metadata
@@ -34,20 +40,19 @@ def native_idle_start_callback(source, adapter, loop, profile_home, *, muted=Fal
     metadata = _interim_metadata(_non_conversational_metadata(
         {"thread_id": thread_id}, platform=Platform.DISCORD))
 
-    async def send_start():
+    async def send_notice():
         try:
             async with asyncio.timeout(10):
                 async with _async_profile_runtime_scope(profile_home):
-                    result = await adapter.send(
-                        thread_id, "正在后台压缩此帖的上下文，原始记录会保留。", metadata=metadata)
+                    result = await adapter.send(thread_id, text, metadata=metadata)
             if not getattr(result, "success", False):
-                logger.debug("Discord idle start notice not delivered to %s", thread_id)
+                logger.debug("Discord idle notice not delivered to %s", thread_id)
         except Exception:
-            logger.debug("Discord idle start notice failed for %s", thread_id, exc_info=True)
+            logger.debug("Discord idle notice failed for %s", thread_id, exc_info=True)
 
     def notify():
         future = safe_schedule_threadsafe(
-            send_start(), loop, logger=logger, log_message="Idle compaction notice scheduling error")
+            send_notice(), loop, logger=logger, log_message="Idle compaction notice scheduling error")
         if future is not None:
             def observe(done):
                 with suppress(Exception):
@@ -236,8 +241,21 @@ def _execute(runner, home, loop, sid, item, cancellation):
                 with timetable._condition:
                     timetable._active_agents[sid] = agent
                 committed = _idle_tick(agent, sid, cancellation)
-                if committed and original is not None:
-                    _evict_compacted_cache(runner, timetable, sid, item, original)
+                if committed:
+                    if original is not None:
+                        _evict_compacted_cache(runner, timetable, sid, item, original)
+                    # Only the durable commit (native or ordinary fallback) may
+                    # claim completion; a cancellation during teardown stays silent.
+                    # Delivery must not alter the committed result.
+                    if not cancellation.is_set():
+                        try:
+                            notice = _native_idle_thread_notice_callback(
+                                source, adapter, loop, home,
+                                "上下文压缩已完成，下次对话会接续压缩结果。")
+                            if notice is not None:
+                                notice()
+                        except Exception:
+                            logger.debug("Discord idle completion notice failed for %s", sid, exc_info=True)
                 return committed
             finally:
                 if agent is not None:
