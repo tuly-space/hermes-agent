@@ -746,6 +746,18 @@ compression:
   # summarization on a short idle thread. Example: 1800 = compact after 30 min idle.
   idle_compact_after_seconds: 0
 
+  # Opt-in native-first maintenance for eligible Codex Responses routes. At
+  # the ordinary local compression trigger, force an inline /responses native
+  # checkpoint first; summarize only if it fails or returns no compaction item.
+  # Requires codex_responses_native: true. Other profiles remain off.
+  codex_responses_native_first: false
+  # Separate from the older next-turn idle_compact_after_seconds. Set 1500 for
+  # a one-shot BACKGROUND timer after a completed turn (25 minutes). Only runs
+  # at >=80K effective full-request tokens and after >=16K growth since the
+  # last idle attempt; no timers for old sessions on process startup.
+  codex_responses_native_idle_after_seconds: 0
+  codex_responses_native_idle_min_tokens: 80000
+
   # Gateway session-hygiene turn-hold budget (default: 10). Max seconds an
   # arriving user turn is held while a still-streaming hygiene summary
   # finishes. Distinct from hygiene_timeout_seconds (compressor inactivity

@@ -2190,6 +2190,8 @@ def conversation_history_after_compression(
     Session rotation returns ``None`` so the child gets the full compacted list. In-place compaction returns a
     shallow copy of the already-persisted rows (else the identity flush re-appends them). Aborted/no-op
     attempts keep the baseline: marking all persisted drops unflushed turns; clearing re-appends rows."""
+    if getattr(agent, "_native_maintenance_committed", False):
+        return list(messages)
     if bool(getattr(agent, "_last_compression_attempt_recorded", False)):
         attempt_in_place = getattr(agent, "_last_compression_attempt_in_place", None)
         if attempt_in_place is True:
@@ -3623,6 +3625,7 @@ def _commit_compaction(
                     agent.session_id, compressed, model_config_patch={PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: None},
                     watermark=lease.watermark, lock_holder=lease.holder,
                     tail_count=sum(1 for m in compressed if id(m) in _tail_tagged_ids),
+                    exact_watermark=getattr(agent, "_native_idle_fallback_watermark", None),
                 )
                 split_status = "in_place_committed"
                 # compress() returned marker-swept copies; stamp them as persisted or the next

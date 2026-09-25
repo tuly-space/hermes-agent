@@ -1077,6 +1077,7 @@ class GatewayTurnMixin:
         _hyg_new_sid = _hyg_agent.session_id
         _hyg_rotated = _hyg_new_sid != session_entry.session_id
         _hyg_in_place = bool(getattr(_hyg_agent, "_last_compaction_in_place", False))
+        _hyg_native = bool(getattr(_hyg_agent, "_native_maintenance_committed", False))
         # Anti-growth guard: refuse a compression that did not shrink the transcript (seen 427K→598K).
         _hyg_in_toks = estimate_messages_tokens_rough(history)
         _hyg_out_toks = estimate_messages_tokens_rough(_compressed)
@@ -1121,12 +1122,14 @@ class GatewayTurnMixin:
                     self._sync_telegram_topic_binding, source, session_entry, reason="hygiene-compression",
                 )
 
-        if _hyg_rotated or _hyg_in_place:
+        if _hyg_rotated or _hyg_in_place or _hyg_native:
             # Rewritten (rotation) or persisted by archive_and_compact() (in-place): reset token count.
             session_entry.last_prompt_tokens = 0
             attempt.history = _compressed
             _new_count = len(_compressed)
-            _new_tokens = estimate_messages_tokens_rough(_compressed)
+            # The raw archive is intact after a native checkpoint. Ciphertext
+            # length is not token cost; let the next provider usage price it.
+            _new_tokens = 0 if _hyg_native else estimate_messages_tokens_rough(_compressed)
         else:
             # No rewrite happened — post-compression counts equal the pre-compression ones.
             _new_count = plan.msg_count
@@ -1143,7 +1146,7 @@ class GatewayTurnMixin:
         )
         if _new_tokens >= plan.warn_token_threshold:
             logger.warning("Session hygiene: still ~%s tokens after compression", f"{_new_tokens:,}")
-        return _hyg_rotated, _hyg_in_place, _new_count, _new_tokens
+        return _hyg_rotated, _hyg_in_place or _hyg_native, _new_count, _new_tokens
 
     async def _hmwa_hygiene_apply_result(
         self, attempt, hs, _compressed, history, plan, *,

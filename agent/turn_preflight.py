@@ -71,6 +71,7 @@ def run_preflight_compression(
         _compression_deferred_result, _maybe_grow_local_window, _provider_overflow_exhausted_result,
         _should_skip_model_call_for_reference_handoff,
     )
+    from agent.native_maintenance import before_summary as _native_first_ready
 
     def _done(action: str, result: Optional[Dict[str, Any]] = None) -> PreflightGateVerdict:
         v.action, v.result = action, result
@@ -97,7 +98,8 @@ def run_preflight_compression(
         _eligible
         and not _review_fork_first_request_pending(agent)
         and (not v._preflight_compression_blocked or provider_overflow_preflight)
-        and (not defer_preflight(request_pressure_tokens) or provider_overflow_preflight)
+        and (not defer_preflight(request_pressure_tokens) or provider_overflow_preflight
+             or _native_first_ready(agent, v.messages))
         and not _compression_cooldown
         and compressor.should_compress(request_pressure_tokens)
     ):
@@ -268,7 +270,9 @@ def compress_after_tool_results(
     _compressor = agent.context_compressor
     # A new checkpoint must reach the provider before stale usage can trigger
     # local compression, overflow warnings, or destructive tool-result pruning.
-    if bool(getattr(_compressor, "awaiting_real_usage_after_compression", False)):
+    from agent.native_maintenance import before_summary
+    if (bool(getattr(_compressor, "awaiting_real_usage_after_compression", False))
+            and not before_summary(agent, messages)):
         return _verdict(False)
     # Real usage decides: the anchor is the provider's last prompt count plus a rough delta for
     # ONLY the tool results appended since (the raw last_prompt_tokens ignores them). Right after

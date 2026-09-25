@@ -242,6 +242,7 @@ class CompressionFacadeMixin:
             resolve_context_compression_timeouts,
         )
         reset_context_compression_timeout_outcome(self)
+        self._native_maintenance_committed = False
         from agent.portal_tags import (
             get_affinity_scope, get_conversation_context, reset_affinity_scope, reset_conversation_context,
             set_affinity_scope, set_conversation_context,
@@ -274,6 +275,34 @@ class CompressionFacadeMixin:
                 fence_stack = vars(self).setdefault("_compression_commit_fence_stack", [])
                 fence_stack.append(registration)
                 self._active_compression_commit_fence = active_fence
+
+            if not force and not focus_topic and not getattr(self, "_native_idle_summary_fallback", False):
+                from agent.native_maintenance import attempt, before_summary
+                if before_summary(self, messages):
+                    threshold = getattr(getattr(self, "context_compressor", None), "threshold_tokens", 0)
+                    if isinstance(approx_tokens, int) and approx_tokens >= threshold > 0:
+                        db, sid = getattr(self, "_session_db", None), getattr(self, "session_id", None)
+                        try:
+                            # Post-tool/pre-API calls flush their tail before checkpointing.
+                            if db is not None and sid and getattr(self, "_active_session_turn_lease_holder", None):
+                                if self._flush_messages_to_session_db(messages) is False:
+                                    raise RuntimeError("Native maintenance input could not be persisted")
+                            watermark = db.get_active_message_watermark(sid) if db is not None and sid else None
+                            native_ok = attempt(
+                                self, messages, getattr(self, "_cached_system_prompt", None) or system_message or "",
+                                approx_tokens, phase="threshold", expected_watermark=watermark,
+                                turn_lease_holder=getattr(self, "_active_session_turn_lease_holder", None),
+                                commit_fence=active_fence,
+                            )
+                        except Exception:
+                            logger.warning("Native pre-summary attempt failed; using ordinary compression", exc_info=True)
+                            native_ok = False
+                        if native_ok:
+                            self._native_maintenance_committed = True
+                            return list(messages), getattr(self, "_cached_system_prompt", None) or system_message
+            # A revoked hygiene/interrupt fence also forbids the summary fallback.
+            if active_fence.is_cancelled:
+                return messages, system_message
 
             def _run(fence=None, target_messages=None, same_turn_fallback_recovery=False):
                 return compress_context(

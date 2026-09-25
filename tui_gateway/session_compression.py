@@ -102,6 +102,15 @@ def _apply_live_compression_config(agent: Any, cfg: dict | None) -> None:
     enabled_raw = compression.get("enabled", True)
     agent.compression_enabled = enabled_raw if isinstance(enabled_raw, bool) else str(enabled_raw).lower() in {"true", "1", "yes"}
     agent.codex_responses_native_compaction = is_truthy_value(compression.get("codex_responses_native", False))
+    agent.compression_native_first = is_truthy_value(compression.get("codex_responses_native_first", False))
+    with contextlib.suppress(TypeError, ValueError):
+        agent.compression_native_idle_after_seconds = max(
+            0, int(compression.get("codex_responses_native_idle_after_seconds", 0) or 0))
+    try:
+        agent.compression_native_idle_min_tokens = max(
+            1, int(compression.get("codex_responses_native_idle_min_tokens", 80_000)))
+    except (TypeError, ValueError):
+        agent.compression_native_idle_min_tokens = 80_000
     native_threshold_raw = compression.get("codex_responses_compact_threshold", 200_000)
     try:
         if isinstance(native_threshold_raw, bool) or (native_threshold := int(native_threshold_raw)) <= 0:

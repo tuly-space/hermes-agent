@@ -112,7 +112,7 @@ def assemble_api_request(
     are injected only after whitespace normalization, the orphan sweep, thinking-only drop /
     user merge and surrogate stripping, so the same row's bytes never vary across turns."""
     from agent.conversation_loop import (
-        _CODEX_INCOMPLETE_NUDGE, _apply_context_engine_selection, _canonicalize_api_tool_calls,
+        _apply_context_engine_selection,
         _clone_message_for_send, _midturn_request_pressure_tokens, _pressure_with_real_floor,
     )
     from agent.model_metadata import estimate_messages_tokens_rough
@@ -143,16 +143,7 @@ def assemble_api_request(
         agent, api_messages, messages, _sel_incoming, logger=request_logger
     )
 
-    # Runs unconditionally (not gated on context_compressor) so orphaned tool
-    # results from session loading or manual message edits are always caught.
-    api_messages = agent._sanitize_api_messages(api_messages)
-    # Send-path vision eviction (#89296): compression only strips stale screenshots
-    # when prune fires, and the Anthropic adapter's keep-window never sees
-    # OpenAI-style tool-result image_url parts. The per-call clone is rewritten in
-    # place; persisted history is untouched.
-    from agent.context_compressor import evict_stale_outbound_tool_images
-
-    evict_stale_outbound_tool_images(api_messages)
+    api_messages = normalize_api_messages_for_send(agent, api_messages)
 
     # One-time repeated-heal notice goes out via the status/warning callback, NEVER
     # appended to messages: the cached prompt prefix stays byte-identical.
@@ -164,31 +155,6 @@ def assemble_api_request(
             agent._emit_warning(_heal_notice)
     except Exception:
         logger.debug("sanitizer heal notice delivery failed", exc_info=True)
-
-    # Drop thinking-only assistant turns + merge adjacent users, API copy only:
-    # Anthropic-style backends 400 on a trailing `thinking` block; history keeps it.
-    # Off the Codex wire (e.g. after a reasoning-only stall fell over to a Chat Completions
-    # provider, #67321) the synthetic continuation nudge is Codex-only control text: drop it
-    # alongside the opaque replay state.
-    _cross_protocol = agent.api_mode != "codex_responses"
-    api_messages = agent._drop_thinking_only_and_merge_users(
-        api_messages, drop_codex_reasoning_items=_cross_protocol,
-        drop_nudge_marker=_CODEX_INCOMPLETE_NUDGE if _cross_protocol else None,
-    )
-
-    # Normalize whitespace and tool-call JSON for bit-perfect prefixes across turns
-    # (KV-cache reuse on local servers, better cloud cache hits); API copy only.
-    for am in api_messages:
-        if isinstance(am.get("content"), str):
-            am["content"] = am["content"].strip()
-    _canonicalize_api_tool_calls(api_messages)
-
-    # Strip lone surrogates (U+D800-U+DFFF) that some Ollama-served models emit;
-    # they crash json.dumps() inside the OpenAI SDK and trigger the 3-retry cycle.
-    _sanitize_messages_surrogates(api_messages)
-
-    # No send-time pad loop here: ``repair_empty_non_final_messages`` (inside
-    # ``_sanitize_api_messages``) is the single owner of empty-turn repair.
 
     # Build the request-local cache sections LAST, after every transcript mutation;
     # the canonical tool registry stays undecorated. Marked ``content`` becomes text
@@ -264,3 +230,44 @@ def assemble_api_request(
         "fallthrough", api_messages, tools_for_api, _moa_prepared_request,
         pending_moa_prepared_request, approx_tokens, request_pressure_tokens, approx_tokens * 4,
     )
+
+
+def normalize_api_messages_for_send(agent: Any, api_messages: list[dict]) -> list[dict]:
+    """Shared transcript send transforms; input must already be a detached API copy."""
+    from agent.conversation_loop import _CODEX_INCOMPLETE_NUDGE, _canonicalize_api_tool_calls
+    from agent.context_compressor import evict_stale_outbound_tool_images
+
+    # Heal orphans, evict stale screenshots, drop thinking-only rows and merge users.
+    api_messages = agent._sanitize_api_messages(api_messages)
+    evict_stale_outbound_tool_images(api_messages)
+    cross_protocol = agent.api_mode != "codex_responses"
+    api_messages = agent._drop_thinking_only_and_merge_users(
+        api_messages, drop_codex_reasoning_items=cross_protocol,
+        drop_nudge_marker=_CODEX_INCOMPLETE_NUDGE if cross_protocol else None,
+    )
+    for am in api_messages:
+        if isinstance(am.get("content"), str):
+            am["content"] = am["content"].strip()
+    _canonicalize_api_tool_calls(api_messages)
+    _sanitize_messages_surrogates(api_messages)
+    return api_messages
+
+
+def maintenance_api_prefix(agent: Any, messages: list[dict], system_prompt: str) -> list[dict]:
+    """Frozen historical prefix through the normal request-copy and send transforms."""
+    from agent.turn_context import build_api_messages
+    import time
+    # Idle has no new turn; freeze the replay-expiry clock for this one build.
+    had_clock = hasattr(agent, "_current_turn_timestamp")
+    if not had_clock:
+        agent._current_turn_timestamp = time.time()
+    try:
+        api_messages, _ = build_api_messages(
+            agent, [m for m in messages if m.get("role") != "system"],
+            current_turn_user_idx=-1, ext_prefetch_cache="",
+            plugin_user_context="", moa_config=None, active_system_prompt=system_prompt,
+        )
+    finally:
+        if not had_clock:
+            del agent._current_turn_timestamp
+    return normalize_api_messages_for_send(agent, api_messages)

@@ -106,6 +106,25 @@ def record_response_usage(
     prompt_tokens = canonical_usage.prompt_tokens
     completion_tokens = canonical_usage.output_tokens
     total_tokens = canonical_usage.total_tokens
+    maintenance_phase = getattr(agent, "_native_maintenance_pending_followup", None)
+    if maintenance_phase:
+        agent._native_maintenance_pending_followup = None
+        if isinstance(aggregator_usage.prompt_tokens, int) and aggregator_usage.prompt_tokens > 0:
+            from agent.native_maintenance import _IDLE_KEY
+            db, sid = getattr(agent, "_session_db", None), getattr(agent, "session_id", None)
+            if db is not None and sid:
+                try:
+                    db.patch_session_model_config(sid, {_IDLE_KEY: {
+                        "model": agent.model, "pressure": aggregator_usage.prompt_tokens}})
+                except Exception:
+                    logger.warning("Native maintenance growth baseline persist failed", exc_info=True)
+        logger.info(
+            "Native maintenance follow-up phase=%s actual_full_input=%s "
+            "actual_cached=%s actual_output=%s session=%s",
+            maintenance_phase, aggregator_usage.prompt_tokens,
+            aggregator_usage.cache_read_tokens, aggregator_usage.output_tokens,
+            getattr(agent, "session_id", None),
+        )
     # Canonical token + cache buckets for context engines; legacy keys stay for back-compat.
     usage_dict = {
         "prompt_tokens": prompt_tokens,

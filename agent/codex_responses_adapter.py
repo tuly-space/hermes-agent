@@ -422,7 +422,9 @@ def _replay_reasoning_items(
                 )
                 _CROSS_ISSUER_WARN_EMITTED = True
             continue
-        replayed.append({k: v for k, v in ri.items() if k not in ("id", "_issuer_kind", "_issuer_model")})
+        replayed.append({k: v for k, v in ri.items() if k not in (
+            "id", "_issuer_kind", "_issuer_model", "_checkpoint_watermark",
+            "_checkpoint_count", "_checkpoint_prefix_digest")})
         if item_id:
             seen_item_ids.add(item_id)
     return replayed
@@ -583,6 +585,8 @@ def _chat_messages_to_responses_input(
     item_sources: List[Optional[Dict[str, Any]]] = []
     seen_item_ids: set = set()
     wire_ids = _WireCallIds()
+    deferred_checkpoints: Dict[int, List[Dict[str, Any]]] = {}
+    covered_messages = [m for m in messages if isinstance(m, dict) and m.get("role") in {"user", "assistant", "tool"}]
     # The ChatGPT Codex backend rejects a role message whose ``content`` is a plain string with
     # ``{"detail": "Unsupported content type"}`` (400) — even a single user turn with no replay state
     # (#51512). It accepts only typed parts, so string text goes out as ``input_text``/``output_text``
@@ -597,6 +601,7 @@ def _chat_messages_to_responses_input(
         role = msg.get("role")
         if role == "tool":
             emit(_tool_output_items(msg, wire_ids=wire_ids), msg)
+            emit(deferred_checkpoints.pop(id(msg), []), msg)
             continue
         if role not in {"user", "assistant"}:
             continue
@@ -611,11 +616,28 @@ def _chat_messages_to_responses_input(
             return [{"type": text_type, "text": value}] if typed_text_only and isinstance(value, str) else value
         if role == "user":
             emit([{"role": role, "content": wire_content(content_parts or content_text)}], msg)
+            emit(deferred_checkpoints.pop(id(msg), []), msg)
             continue
         reasoning_items = [] if not replay_encrypted_reasoning else _replay_reasoning_items(
             msg, seen_item_ids=seen_item_ids, current_issuer_kind=current_issuer_kind,
             current_issuer_model=current_issuer_model, native_compaction_eligible=native_compaction_eligible,
         )
+        # Maintenance can cover a completed tool/user tail while its durable
+        # sidecar lives on the preceding assistant. Reposition the checkpoint
+        # AFTER the final covered row; otherwise replay duplicates that tail.
+        for ri in list(reasoning_items):
+            source = next((raw for raw in _as_list(msg.get("codex_reasoning_items"))
+                           if isinstance(raw, dict) and raw.get("encrypted_content") == ri.get("encrypted_content")
+                           and raw.get("type") == "compaction"), None)
+            count = source.get("_checkpoint_count") if source else None
+            if isinstance(count, int):
+                reasoning_items.remove(ri)
+                # Gateway readers omit row ids. Validate the entire priced
+                # prefix so a rewritten/rewound history fails closed to raw.
+                if 0 < count <= len(covered_messages):
+                    from agent.native_maintenance import _prefix_digest
+                    if source is not None and _prefix_digest(covered_messages[:count]) == source.get("_checkpoint_prefix_digest"):
+                        deferred_checkpoints.setdefault(id(covered_messages[count - 1]), []).append(ri)
         emit(reasoning_items, msg)
         message_items = _replay_message_items(
             msg, is_github_responses=is_github_responses, current_issuer_kind=current_issuer_kind,
@@ -633,6 +655,9 @@ def _chat_messages_to_responses_input(
             follower = " " if fallback == "" else fallback
             emit([{"role": "assistant", "content": wire_content(follower)}], msg)
         emit(tool_items, msg)
+        emit(deferred_checkpoints.pop(id(msg), []), msg)
+    # A missing boundary is not a license to replay a checkpoint at the wrong
+    # position. The full raw transcript remains available as the safe fallback.
     # The server renders nothing placed before a compaction item, so pre-checkpoint history is
     # dead weight and plaintext asks / merged summaries silently vanish. Keep the newest checkpoint
     # first, retain pre-checkpoint USER and SUMMARY messages within a token budget, leave the tail.

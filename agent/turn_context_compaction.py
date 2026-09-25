@@ -161,6 +161,9 @@ def _idle_compaction(
     # still needed.  Threshold and post-tool preflight honor the same latch.
     if bool(getattr(_compressor, "awaiting_real_usage_after_compression", False)):
         return
+    from agent.native_maintenance import before_summary
+    if before_summary(agent, messages):
+        return
     # Route-aware pressure: on compacted native-Codex sessions the durable figure
     # overstates the wire, so reuse the preflight estimator.
     _idle_tokens = _tc._preflight_request_tokens(
@@ -245,6 +248,10 @@ def _preflight_compression(
         _compressor.threshold_tokens,
     ):
         return
+    # Defer native-first until context injection and durable turn-start flush.
+    from agent.native_maintenance import before_summary
+    if before_summary(agent, out.messages):
+        return
 
     _preflight_tokens = _tc._preflight_request_tokens(
         agent, out.messages, out.active_system_prompt or ""
@@ -259,7 +266,8 @@ def _preflight_compression(
         if isinstance(_snapshot_val, int) and not isinstance(_snapshot_val, bool):
             agent._turn_preflight_display_snapshot = _snapshot_val
     # An anchored figure is real usage + delta: never deferred.
-    _preflight_deferred = not getattr(agent, "_request_pressure_anchored", False) and getattr(
+    _native_first_ready = before_summary(agent, out.messages)
+    _preflight_deferred = not _native_first_ready and not getattr(agent, "_request_pressure_anchored", False) and getattr(
         _compressor, "should_defer_preflight_to_real_usage", lambda _tokens: False
     )(_preflight_tokens)
     _codex_native_auto = _codex_native_auto_compaction(agent)
@@ -382,6 +390,13 @@ def _run_preflight_passes(
             _preflight_input, system_message, approx_tokens=_preflight_tokens,
             task_id=effective_task_id,
         )
+        if getattr(agent, "_native_maintenance_committed", False):
+            # The checkpoint changes the wire, not the raw transcript. Its opaque
+            # token cost is only known after the next real provider response.
+            out.conversation_history = conversation_history_after_compression(
+                agent, out.messages, out.conversation_history
+            )
+            break
         if out.messages is _preflight_input and compression_skipped_due_to_lock(agent):
             # Lock-skip: another path holds the lock, so this is a DEFER, not proof of
             # incompressibility — don't arm the blocker; stop passes this turn.

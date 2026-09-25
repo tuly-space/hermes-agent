@@ -114,6 +114,41 @@ def _stale_holder(row, now: float) -> bool:
 class SessionMessagesMixin:
     """Message append/replace/rewind, reactions, resume conversations, replay dedupe."""
 
+    def attach_native_checkpoint(self, session_id: str, expected_watermark: int,
+                                 assistant_row_id: int, item: Dict[str, Any],
+                                 *, turn_lease_holder: Optional[str] = None) -> bool:
+        """Atomically attach an opaque checkpoint without rewriting or archiving raw history.
+
+        The watermark and turn lease fence a delayed idle response against any new message,
+        reset, or competing turn. A stale result is discarded, never published.
+        """
+        if item.get("type") != "compaction" or not isinstance(item.get("encrypted_content"), str) or not item["encrypted_content"]:
+            return False
+        def _write(conn):
+            self._check_transcript_write_guards(
+                conn, session_id, None, turn_lease_holder=turn_lease_holder,
+                reject_active_turn_lease=not bool(turn_lease_holder),
+                reject_active_compression_lock=True,
+            )
+            current = conn.execute(
+                "SELECT MAX(id) FROM messages WHERE session_id = ? AND active = 1", (session_id,)
+            ).fetchone()[0]
+            if current != expected_watermark:
+                return False
+            row = conn.execute(
+                "SELECT codex_reasoning_items FROM messages WHERE id = ? AND session_id = ? "
+                "AND active = 1 AND role = 'assistant'", (assistant_row_id, session_id)
+            ).fetchone()
+            if row is None:
+                return False
+            existing = _json_or(row[0], [], "Invalid native checkpoint carrier") if row[0] else []
+            if not isinstance(existing, list):
+                return False
+            # Older checkpoint items remain in raw history but are shadowed for replay.
+            conn.execute(_SET_CODEX_REASONING_SQL, (json.dumps(existing + [item]), assistant_row_id))
+            return True
+        return self._execute_write(_write, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
+
     def _bump_conversation_generation(self, conn, session_id: str, end_reason: str) -> None:
         """Advance the peer's conversation generation past a boundary, in the txn that writes it. Only
         ``_RESET_END_REASONS`` count (compression continues one conversation). Never derived from session
@@ -664,7 +699,8 @@ class SessionMessagesMixin:
 
     def archive_and_compact(self, session_id: str, compacted_messages: List[Dict[str, Any]],
         model_config_patch: Optional[Dict[str, Any]] = None, watermark: Optional[int] = None,
-        lock_holder: Optional[str] = None, tail_count: int = 0) -> int:
+        lock_holder: Optional[str] = None, tail_count: int = 0,
+        turn_lease_holder: Optional[str] = None, exact_watermark: Optional[int] = None) -> int:
         """Non-destructive in-place compaction under ONE session id: soft-archive the active rows (``active=0,
         compacted=1``: summarized away, still searchable) and insert *compacted_messages* as fresh active
         rows, atomically; returns the new ACTIVE count (= ``message_count``). *watermark* (compression
@@ -685,6 +721,13 @@ class SessionMessagesMixin:
         """
         from hermes_state import SessionCompressionInProgressError
         def _do(conn):
+            if exact_watermark is not None:
+                self._check_transcript_write_guards(conn, session_id, lock_holder,
+                    turn_lease_holder=turn_lease_holder,
+                    reject_active_turn_lease=turn_lease_holder is None)
+                if conn.execute("SELECT MAX(id) FROM messages WHERE session_id = ? AND active = 1",
+                                (session_id,)).fetchone()[0] != exact_watermark:
+                    raise SessionCompressionInProgressError("Idle fallback transcript changed before commit")
             if lock_holder is not None:
                 lock_row = conn.execute(_COMPRESSION_LOCK_ROW_SQL, (session_id,)).fetchone()
                 if lock_row is None or lock_row["holder"] != lock_holder or float(lock_row["expires_at"]) <= time.time():

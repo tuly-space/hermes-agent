@@ -1686,6 +1686,7 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
                     from agent.usage_anchor import set_usage_anchor
 
                     set_usage_anchor(agent, None)
+                    agent._native_maintenance_pending_followup = "inline"
 
     if assistant_tool_calls:
         msg["tool_calls"] = [_assistant_tool_call_dict(agent, tc, i) for i, tc in enumerate(assistant_tool_calls)]
