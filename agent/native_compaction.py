@@ -65,9 +65,11 @@ def is_native_compaction_model(
 
 def sol_native_route(agent: Any) -> bool:
     """The one verified cross-model Codex route, without trusting a provider override."""
+    capabilities = getattr(agent, "runtime_capabilities", None)
+    if isinstance(capabilities, dict) and not capabilities.get("native_compaction", False):
+        return False
     return bool(
         getattr(agent, "compression_aux_native", None) is True
-        and not getattr(agent, "_sol_native_replay_disabled", False)
         and getattr(agent, "api_mode", None) == "codex_responses"
         and getattr(agent, "provider", None) == "openai-codex"
         and is_official_codex_base_url(getattr(agent, "base_url", "") or "")

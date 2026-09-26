@@ -460,13 +460,6 @@ def _recover_stale_codex_reasoning(agent: Any, _retry: TurnRetryState, messages:
         return False
     _retry.invalid_encrypted_content_retry_attempted = True
     replay_stats = agent._disable_codex_reasoning_replay(messages)
-    if getattr(agent, "compression_aux_native", None) is True:
-        # Raw transcript rows stay intact; a fresh agent must not replay the same
-        # rejected checkpoint or start another native maintenance attempt.
-        agent._sol_native_replay_disabled = True
-        db, sid = getattr(agent, "_session_db", None), getattr(agent, "session_id", None)
-        if db is not None and sid:
-            db.patch_session_model_config(sid, {"sol_native_replay_disabled": True})
     _vlines(
         agent,
         f"⚠️  Encrypted reasoning replay was rejected by the provider — "

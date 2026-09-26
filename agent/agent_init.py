@@ -2013,12 +2013,6 @@ def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_c
     agent.compression_aux_provider = auxiliary_compression.get("provider")
     agent.compression_aux_model = auxiliary_compression.get("model")
     agent.compression_aux_base_url = auxiliary_compression.get("base_url")
-    if session_db is not None and agent.session_id:
-        agent._sol_native_replay_disabled = bool(session_db.get_session_model_config_value(
-            agent.session_id, "sol_native_replay_disabled", False
-        ))
-        if agent._sol_native_replay_disabled:
-            agent._codex_reasoning_replay_enabled = False
     agent.compression_native_idle_after_seconds = cs.codex_responses_native_idle_after_seconds
     agent.compression_native_idle_min_tokens = cs.codex_responses_native_idle_min_tokens
 

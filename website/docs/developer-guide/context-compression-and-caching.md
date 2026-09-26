@@ -481,9 +481,9 @@ checkpoint. With `preserve_reasoning: true`, maintenance also forwards actual
 encrypted Astra reasoning items; with `false`, it keeps checkpoints, messages,
 tool calls and results while omitting prior reasoning. No encrypted item is
 rendered as summary text. The cross-model exception is restricted to this
-official Astra/Sol pair. A rejected encrypted item disables native replay in
-the session's existing model config, so a cold resume uses raw history and
-ordinary compression. Missing `native` retains the legacy behavior above;
+official Astra/Sol pair. Timeout, cancellation and failure recovery use the
+existing compaction behavior without a separate policy. Missing `native`
+retains the legacy behavior above;
 explicit `false` uses ordinary summarization. Global compression, checkpoint,
 route and cancellation gates still apply.
 

@@ -35,18 +35,6 @@ def eligible(agent: Any) -> bool:
     return bool(native_compaction_context_management(agent, **classify_responses_route(agent)._asdict()))
 
 
-def _has_pending_tool_call(messages: list[dict]) -> bool:
-    pending: set[str] = set()
-    for message in messages:
-        for call in message.get("tool_calls") or []:
-            if not isinstance(call, dict) or not isinstance(call.get("id"), str):
-                return True
-            pending.add(call["id"])
-        if message.get("role") == "tool":
-            pending.discard(message.get("tool_call_id"))
-    return bool(pending)
-
-
 def before_summary(agent: Any, messages: list[dict]) -> bool:
     """An unpriced prior checkpoint must get one real normal response first."""
     if not eligible(agent):
@@ -77,8 +65,7 @@ def attempt(agent: Any, messages: list[dict], system_prompt: str, before_tokens:
     so consume the raw events with the production assembler. No output is delivered.
     """
     agent._native_maintenance_abort_fallback = False
-    if (not eligible(agent) or not messages or getattr(agent, "_interrupt_requested", False)
-            or _has_pending_tool_call(messages)):
+    if not eligible(agent) or not messages or getattr(agent, "_interrupt_requested", False):
         agent._native_maintenance_abort_fallback = True
         return False
     carrier = next((m for m in reversed(messages) if m.get("role") == "assistant"), None)
@@ -110,8 +97,7 @@ def attempt(agent: Any, messages: list[dict], system_prompt: str, before_tokens:
             agent._native_maintenance_abort_fallback = True
             return False
     started = time.monotonic()
-    client = stream = watchdog = None
-    deadline_expired = threading.Event()
+    client = stream = None
     outcome = "failed"
     reason = "no_compaction_item"
     input_tokens = cached_tokens = output_tokens = None
@@ -179,13 +165,6 @@ def attempt(agent: Any, messages: list[dict], system_prompt: str, before_tokens:
         kwargs = _sanitize_consumer_codex_request(agent, kwargs)
         kwargs["stream"] = True
         client = agent._create_request_openai_client(reason="native_maintenance", api_kwargs=kwargs)
-        def _expire_request():
-            deadline_expired.set()
-            agent._abort_request_openai_client(client, reason="native_maintenance_deadline")
-
-        watchdog = threading.Timer(kwargs["timeout"], _expire_request)
-        watchdog.daemon = True
-        watchdog.start()
         if phase == "idle":
             agent._native_idle_client = client
             if getattr(agent, "_native_idle_cancel", threading.Event()).is_set():
@@ -200,13 +179,7 @@ def attempt(agent: Any, messages: list[dict], system_prompt: str, before_tokens:
             nonlocal terminal_seen
             if _event_field(event, "type") == "response.completed":
                 terminal_seen = True
-        result = _consume_codex_event_stream(
-            stream, model=kwargs["model"], on_event=_terminal_event,
-            interrupt_check=deadline_expired.is_set,
-        )
-        if deadline_expired.is_set():
-            reason = "request_deadline"
-            return False
+        result = _consume_codex_event_stream(stream, model=kwargs["model"], on_event=_terminal_event)
         input_tokens, cached_tokens, output_tokens = _usage(result.usage)
         if not terminal_seen or result.status != "completed":
             reason = "truncated_stream" if not terminal_seen else f"response_{result.status}"
@@ -233,9 +206,6 @@ def attempt(agent: Any, messages: list[dict], system_prompt: str, before_tokens:
             checkpoint["_checkpoint_watermark"] = expected_watermark
             checkpoint["_checkpoint_count"] = len(covered)
             checkpoint["_checkpoint_prefix_digest"] = _prefix_digest(covered)
-        if deadline_expired.is_set():
-            reason = "request_deadline"
-            return False
         if commit_fence is not None and not commit_fence.begin_commit(
                 getattr(agent, "_native_idle_cancel", None) if phase == "idle" else None):
             reason = "commit_admission_revoked"
@@ -297,9 +267,6 @@ def attempt(agent: Any, messages: list[dict], system_prompt: str, before_tokens:
         logger.warning("Native maintenance failed (%s, session=%s, reason=%s)", phase, sid, reason, exc_info=True)
         return False
     finally:
-        if watchdog is not None:
-            watchdog.cancel()
-            watchdog.join()
         if phase == "idle" and getattr(agent, "_native_idle_client", None) is client:
             agent._native_idle_client = None
         if stream is not None:

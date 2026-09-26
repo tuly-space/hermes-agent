@@ -1,8 +1,6 @@
-"""The official Astra/Sol maintenance route and durable replay contract."""
+"""Auxiliary native/reasoning settings on the verified Codex Astra/Sol route."""
 
 import copy
-import threading
-import time
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -10,8 +8,6 @@ import pytest
 
 from agent import native_maintenance
 from agent.chat_completion_helpers import build_api_kwargs
-from agent.turn_retry_state import TurnRetryState
-from agent.turn_recovery import _recover_stale_codex_reasoning
 from hermes_state import SessionDB
 from run_agent import AIAgent
 
@@ -85,6 +81,8 @@ def test_sol_maintenance_uses_session_route_and_replays_checkpoint_after_resume(
         assert any(i.get("type") == "function_call" for i in items)
         assert any(i.get("type") == "function_call_output" for i in items)
         assert ("opaque-astra-bytes" in str(items)) is preserve
+        if not preserve:
+            assert not any(i.get("type") == "reasoning" and i.get("encrypted_content") for i in items)
         assert all("opaque-astra-bytes" not in str(i) for i in items if i.get("role") == "user")
         saved = db.get_messages_as_conversation("sol-cycle")
         assert [m["content"] for m in saved] == [m["content"] for m in _messages()]
@@ -136,11 +134,14 @@ def test_sol_maintenance_uses_session_route_and_replays_checkpoint_after_resume(
         db.close()
 
 
-def test_opt_in_controls_and_rejected_checkpoint_survive_new_agent(tmp_path, monkeypatch):
+def test_opt_in_controls(tmp_path, monkeypatch):
     home = tmp_path / "profile"
     agent = _agent(home, monkeypatch)
     try:
         assert native_maintenance.eligible(agent)
+        agent.runtime_capabilities["native_compaction"] = False
+        assert not native_maintenance.eligible(agent)
+        agent.runtime_capabilities["native_compaction"] = True
         assert "context_management" not in build_api_kwargs(agent, [
             {"role": "system", "content": "Frozen"}, {"role": "user", "content": "Hello"}])
     finally:
@@ -163,7 +164,12 @@ def test_opt_in_controls_and_rejected_checkpoint_survive_new_agent(tmp_path, mon
     assert not any(i.get("type") == "compaction" for i in custom["input"])
     ordinary = _agent(other_home, monkeypatch, native=False)
     try:
+        # Explicit false overrides the legacy native flags, not just the new route.
+        ordinary.codex_responses_native_compaction = True
+        ordinary.compression_native_first = True
         assert not native_maintenance.eligible(ordinary)
+        assert "context_management" not in build_api_kwargs(ordinary, [
+            {"role": "system", "content": "Frozen"}, {"role": "user", "content": "Hello"}])
     finally:
         ordinary.close()
     back_to_first = _agent(home, monkeypatch, write_config=False)
@@ -176,120 +182,6 @@ def test_opt_in_controls_and_rejected_checkpoint_survive_new_agent(tmp_path, mon
         assert legacy.compression_aux_native is None
     finally:
         legacy.close()
-
-    db = SessionDB(db_path=tmp_path / "session.db")
-    db.create_session("sol-cycle", source="cli", model="gpt-6-astra")
-    db.append_messages_batch("sol-cycle", _messages())
-    persisted = db.get_messages_as_conversation("sol-cycle", include_row_ids=True)
-    assert db.attach_native_checkpoint(
-        "sol-cycle", db.get_active_message_watermark("sol-cycle"), persisted[-1]["_row_id"],
-        {"type": "compaction", "encrypted_content": "rejected-sol-checkpoint",
-         "_issuer_kind": "codex_backend", "_issuer_model": "gpt-6-sol",
-         "_checkpoint_count": len(persisted),
-         "_checkpoint_prefix_digest": native_maintenance._prefix_digest(persisted)},
-    )
-    active = _agent(home, monkeypatch, db)
-    try:
-        rows = db.get_messages_as_conversation("sol-cycle")
-        assert _recover_stale_codex_reasoning(active, TurnRetryState(), rows)
-        assert db.get_session_model_config_value("sol-cycle", "sol_native_replay_disabled") is True
-    finally:
-        active.close()
-    fresh = _agent(home, monkeypatch, db)
-    try:
-        assert fresh._codex_reasoning_replay_enabled is False
-        assert not native_maintenance.eligible(fresh)
-        assert all(i.get("type") != "reasoning" for i in build_api_kwargs(fresh, [
-            {"role": "system", "content": "Frozen"}] + db.get_messages_as_conversation("sol-cycle"))["input"])
-        assert any("rejected-sol-checkpoint" in str(m.get("codex_reasoning_items"))
-                   for m in db.get_messages_as_conversation("sol-cycle"))
-    finally:
-        fresh.close()
-        db.close()
-
-
-def test_pending_tool_and_blocked_keepalive_cannot_commit(tmp_path, monkeypatch):
-    db = SessionDB(db_path=tmp_path / "session.db")
-    db.create_session("sol-cycle", source="cli", model="gpt-6-astra")
-    db.append_messages_batch("sol-cycle", _messages())
-    agent = _agent(tmp_path / "profile", monkeypatch, db)
-    try:
-        rows = db.get_messages_as_conversation("sol-cycle", include_row_ids=True)
-        pending = rows + [{"role": "assistant", "content": "", "tool_calls": [{
-            "id": "unanswered", "function": {"name": "read_only", "arguments": "{}"}}]}]
-        assert not native_maintenance.attempt(agent, pending, "Frozen", 100_000, phase="threshold")
-        assert agent._native_maintenance_abort_fallback is True
-        from agent import conversation_compression
-        summaries = Mock()
-        monkeypatch.setattr(conversation_compression, "compress_context", summaries)
-        unchanged, _ = agent._compress_context(
-            pending, "Frozen", approx_tokens=agent.context_compressor.threshold_tokens)
-        assert unchanged is pending
-        summaries.assert_not_called()
-        agent.compression_aux_native = False
-        unchanged, _ = agent._compress_context(
-            pending, "Frozen", approx_tokens=agent.context_compressor.threshold_tokens)
-        assert unchanged is pending
-        summaries.assert_not_called()
-        agent.compression_aux_native = True
-
-        stopped = threading.Event()
-        class Stream:
-            def __iter__(self):
-                while not stopped.wait(0.002):
-                    yield {"type": "response.in_progress"}
-            def close(self):
-                stopped.set()
-        client = SimpleNamespace(responses=SimpleNamespace(create=lambda **kw: Stream()))
-        monkeypatch.setattr(agent, "_create_request_openai_client", lambda **kw: client)
-        monkeypatch.setattr(agent, "_close_request_openai_client", lambda *a, **kw: None)
-        monkeypatch.setattr(agent, "_abort_request_openai_client", lambda c, **kw: stopped.set())
-        monkeypatch.setattr(agent, "_resolved_api_call_timeout", lambda: 0.05)
-        started = time.monotonic()
-        assert not native_maintenance.attempt(
-            agent, rows, "Frozen", 100_000, phase="threshold",
-            expected_watermark=db.get_active_message_watermark("sol-cycle"),
-        )
-        assert time.monotonic() - started < 1.0
-        assert stopped.is_set()
-        assert agent._native_maintenance_abort_fallback is False
-        assert not any(m.get("codex_reasoning_items", [{}])[-1].get("type") == "compaction"
-                       for m in db.get_messages_as_conversation("sol-cycle"))
-    finally:
-        agent.close()
-        db.close()
-
-
-def test_stale_commit_suppresses_summary_fallback(tmp_path, monkeypatch):
-    db = SessionDB(db_path=tmp_path / "session.db")
-    db.create_session("sol-cycle", source="cli", model="gpt-6-astra")
-    db.append_messages_batch("sol-cycle", _messages())
-    agent = _agent(tmp_path / "profile", monkeypatch, db)
-    class Stream:
-        def __iter__(self):
-            db.append_message("sol-cycle", "user", "New foreground input")
-            return _events()
-        def close(self):
-            pass
-    client = SimpleNamespace(responses=SimpleNamespace(create=lambda **kw: Stream()))
-    monkeypatch.setattr(agent, "_create_request_openai_client", lambda **kw: client)
-    monkeypatch.setattr(agent, "_close_request_openai_client", lambda *a, **kw: None)
-    from agent import conversation_compression
-    summaries = Mock()
-    monkeypatch.setattr(conversation_compression, "compress_context", summaries)
-    try:
-        rows = db.get_messages_as_conversation("sol-cycle", include_row_ids=True)
-        unchanged, _ = agent._compress_context(
-            rows, "Frozen", approx_tokens=agent.context_compressor.threshold_tokens)
-        assert unchanged is rows
-        summaries.assert_not_called()
-        assert agent._native_maintenance_abort_fallback is True
-        assert not any(i.get("type") == "compaction" for m in db.get_messages_as_conversation("sol-cycle")
-                       for i in m.get("codex_reasoning_items", []))
-    finally:
-        agent.close()
-        db.close()
-
 
 def test_native_response_without_checkpoint_uses_ordinary_summary(tmp_path, monkeypatch):
     agent = _agent(tmp_path / "profile", monkeypatch)
