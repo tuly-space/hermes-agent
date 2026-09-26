@@ -1287,6 +1287,18 @@ class GatewayTurnMixin:
             _hyg_agent._end_session_on_close = False
             _hyg_agent._print_fn = lambda *a, **kw: None
 
+            # Only the admitted auxiliary-native route needs the request's full budget.
+            # Ordinary summaries keep the gateway's short turn-hold and idle limits.
+            from agent.native_maintenance import before_summary
+            if before_summary(_hyg_agent, _hyg_msgs):
+                from agent.native_compaction import sol_native_route
+                if sol_native_route(_hyg_agent):
+                    from agent.auxiliary_client import _effective_aux_timeout
+                    _native_budget = _effective_aux_timeout("compression", None)
+                    hs.timeout_seconds = _native_budget
+                    hs.total_ceiling_seconds = _native_budget
+                    hs.max_turn_hold_seconds = _native_budget
+
             loop = asyncio.get_running_loop()
             _hyg_commit_fence = CompressionCommitFence(total_ceiling_seconds=hs.total_ceiling_seconds)
             # Default executor (NOT self._get_executor): a hung summary must never occupy an
