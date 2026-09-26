@@ -25,12 +25,26 @@ def _prefix_digest(messages: list[dict]) -> str:
 
 def eligible(agent: Any) -> bool:
     from agent.codex_responses_adapter import classify_responses_route
-    from agent.native_compaction import native_compaction_context_management
+    from agent.native_compaction import native_compaction_context_management, sol_native_route
 
+    if getattr(agent, "compression_aux_native", None) is not None:
+        return sol_native_route(agent)
     if (getattr(agent, "api_mode", None) != "codex_responses"
             or not getattr(agent, "compression_native_first", False)):
         return False
     return bool(native_compaction_context_management(agent, **classify_responses_route(agent)._asdict()))
+
+
+def _has_pending_tool_call(messages: list[dict]) -> bool:
+    pending: set[str] = set()
+    for message in messages:
+        for call in message.get("tool_calls") or []:
+            if not isinstance(call, dict) or not isinstance(call.get("id"), str):
+                return True
+            pending.add(call["id"])
+        if message.get("role") == "tool":
+            pending.discard(message.get("tool_call_id"))
+    return bool(pending)
 
 
 def before_summary(agent: Any, messages: list[dict]) -> bool:
@@ -63,7 +77,8 @@ def attempt(agent: Any, messages: list[dict], system_prompt: str, before_tokens:
     so consume the raw events with the production assembler. No output is delivered.
     """
     agent._native_maintenance_abort_fallback = False
-    if not eligible(agent) or not messages or getattr(agent, "_interrupt_requested", False):
+    if (not eligible(agent) or not messages or getattr(agent, "_interrupt_requested", False)
+            or _has_pending_tool_call(messages)):
         agent._native_maintenance_abort_fallback = True
         return False
     carrier = next((m for m in reversed(messages) if m.get("role") == "assistant"), None)
@@ -95,7 +110,8 @@ def attempt(agent: Any, messages: list[dict], system_prompt: str, before_tokens:
             agent._native_maintenance_abort_fallback = True
             return False
     started = time.monotonic()
-    client = stream = None
+    client = stream = watchdog = None
+    deadline_expired = threading.Event()
     outcome = "failed"
     reason = "no_compaction_item"
     input_tokens = cached_tokens = output_tokens = None
@@ -106,7 +122,11 @@ def attempt(agent: Any, messages: list[dict], system_prompt: str, before_tokens:
         from agent.codex_runtime import (
             _consume_codex_event_stream, _event_field, _sanitize_consumer_codex_request,
         )
-        from agent.codex_responses_adapter import classify_responses_route
+        from agent.codex_responses_adapter import (
+            classify_responses_route, _chat_messages_to_responses_input,
+            _classify_responses_issuer, _wire_model_identity,
+        )
+        from agent.native_compaction import sol_native_route
         from agent.sdk_transform_bypass import bypass_sdk_request_transform
 
         route = classify_responses_route(agent)
@@ -129,8 +149,19 @@ def attempt(agent: Any, messages: list[dict], system_prompt: str, before_tokens:
                     setattr(agent, key, one_shots[key])
                 else:
                     vars(agent).pop(key, None)
-        if "context_management" not in kwargs:
+        sol_route = sol_native_route(agent)
+        if not sol_route and "context_management" not in kwargs:
             return False
+        if sol_route:
+            # The ordinary builder supplies the frozen instructions/tools/cache key. Rebuild
+            # only its input for the actual destination model; source stamps stay untouched.
+            kwargs["model"] = "gpt-6-sol"
+            kwargs["input"] = _chat_messages_to_responses_input(
+                api_prefix, current_issuer_kind="codex_backend", current_issuer_model="gpt-6-sol",
+                native_compaction_eligible=True, approved_sol_pair="maintenance",
+                preserve_reasoning=bool(getattr(agent, "compression_aux_preserve_reasoning", False)),
+                replay_encrypted_reasoning=bool(getattr(agent, "_codex_reasoning_replay_enabled", True)),
+            )
         # The full frozen instructions/tools prefix comes from the ordinary builder.
         # A low maintenance-only threshold forces a real checkpoint even below the
         # automatic native threshold; it never changes the next normal call's policy.
@@ -148,6 +179,13 @@ def attempt(agent: Any, messages: list[dict], system_prompt: str, before_tokens:
         kwargs = _sanitize_consumer_codex_request(agent, kwargs)
         kwargs["stream"] = True
         client = agent._create_request_openai_client(reason="native_maintenance", api_kwargs=kwargs)
+        def _expire_request():
+            deadline_expired.set()
+            agent._abort_request_openai_client(client, reason="native_maintenance_deadline")
+
+        watchdog = threading.Timer(kwargs["timeout"], _expire_request)
+        watchdog.daemon = True
+        watchdog.start()
         if phase == "idle":
             agent._native_idle_client = client
             if getattr(agent, "_native_idle_cancel", threading.Event()).is_set():
@@ -162,7 +200,13 @@ def attempt(agent: Any, messages: list[dict], system_prompt: str, before_tokens:
             nonlocal terminal_seen
             if _event_field(event, "type") == "response.completed":
                 terminal_seen = True
-        result = _consume_codex_event_stream(stream, model=kwargs["model"], on_event=_terminal_event)
+        result = _consume_codex_event_stream(
+            stream, model=kwargs["model"], on_event=_terminal_event,
+            interrupt_check=deadline_expired.is_set,
+        )
+        if deadline_expired.is_set():
+            reason = "request_deadline"
+            return False
         input_tokens, cached_tokens, output_tokens = _usage(result.usage)
         if not terminal_seen or result.status != "completed":
             reason = "truncated_stream" if not terminal_seen else f"response_{result.status}"
@@ -179,7 +223,6 @@ def attempt(agent: Any, messages: list[dict], system_prompt: str, before_tokens:
             reason = "new_turn_or_shutdown"
             agent._native_maintenance_abort_fallback = True
             return False
-        from agent.codex_responses_adapter import _classify_responses_issuer, _wire_model_identity
         checkpoint = {
             "type": "compaction", "encrypted_content": checkpoints[-1],
             "_issuer_kind": _classify_responses_issuer(
@@ -190,6 +233,9 @@ def attempt(agent: Any, messages: list[dict], system_prompt: str, before_tokens:
             checkpoint["_checkpoint_watermark"] = expected_watermark
             checkpoint["_checkpoint_count"] = len(covered)
             checkpoint["_checkpoint_prefix_digest"] = _prefix_digest(covered)
+        if deadline_expired.is_set():
+            reason = "request_deadline"
+            return False
         if commit_fence is not None and not commit_fence.begin_commit(
                 getattr(agent, "_native_idle_cancel", None) if phase == "idle" else None):
             reason = "commit_admission_revoked"
@@ -251,6 +297,9 @@ def attempt(agent: Any, messages: list[dict], system_prompt: str, before_tokens:
         logger.warning("Native maintenance failed (%s, session=%s, reason=%s)", phase, sid, reason, exc_info=True)
         return False
     finally:
+        if watchdog is not None:
+            watchdog.cancel()
+            watchdog.join()
         if phase == "idle" and getattr(agent, "_native_idle_client", None) is client:
             agent._native_idle_client = None
         if stream is not None:

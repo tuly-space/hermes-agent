@@ -16,7 +16,8 @@ def _tui_compression_config_signature(cfg: dict | None) -> tuple:
     cache-busting extract plus ``idle_compact_after_seconds``/``tail_mode`` (live-TUI-only keys)."""
     from gateway.run import GatewayRunner
     keys = GatewayRunner._extract_cache_busting_config(cfg)
-    picked = {k: v for k, v in keys.items() if k.startswith("compression.") or k == "model.context_length"}
+    picked = {k: v for k, v in keys.items() if k.startswith(("compression.", "auxiliary.compression."))
+              or k == "model.context_length"}
     compression = cfg.get("compression") if isinstance(cfg, dict) and isinstance(cfg.get("compression"), dict) else {}
     picked.update({f"compression.{k}": compression.get(k) for k in ("idle_compact_after_seconds", "tail_mode")})
     return tuple(sorted(picked.items()))
@@ -103,6 +104,15 @@ def _apply_live_compression_config(agent: Any, cfg: dict | None) -> None:
     agent.compression_enabled = enabled_raw if isinstance(enabled_raw, bool) else str(enabled_raw).lower() in {"true", "1", "yes"}
     agent.codex_responses_native_compaction = is_truthy_value(compression.get("codex_responses_native", False))
     agent.compression_native_first = is_truthy_value(compression.get("codex_responses_native_first", False))
+    auxiliary = cfg.get("auxiliary") if isinstance(cfg.get("auxiliary"), dict) else {}
+    aux_compression = auxiliary.get("compression") if isinstance(auxiliary.get("compression"), dict) else {}
+    agent.compression_aux_native = (
+        is_truthy_value(aux_compression["native"]) if "native" in aux_compression else None
+    )
+    agent.compression_aux_preserve_reasoning = is_truthy_value(aux_compression.get("preserve_reasoning", False))
+    agent.compression_aux_provider = aux_compression.get("provider")
+    agent.compression_aux_model = aux_compression.get("model")
+    agent.compression_aux_base_url = aux_compression.get("base_url")
     with contextlib.suppress(TypeError, ValueError):
         agent.compression_native_idle_after_seconds = max(
             0, int(compression.get("codex_responses_native_idle_after_seconds", 0) or 0))

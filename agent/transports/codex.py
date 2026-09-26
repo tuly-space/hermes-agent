@@ -631,15 +631,25 @@ class ResponsesApiTransport(ProviderTransport):
     def convert_messages(self, messages: list[dict[str, Any]], **kwargs) -> Any:
         """Convert OpenAI chat messages to Responses API input items."""
         from agent.codex_responses_adapter import _chat_messages_to_responses_input, _wire_model_identity
+        from agent.codex_headers import is_official_codex_base_url
 
         self._last_issuer_model = _wire_model_identity(kwargs.get("model"))
+        sol_checkpoint_replay = bool(
+            kwargs.get("sol_checkpoint_replay") is True
+            and kwargs.get("provider") == "openai-codex"
+            and kwargs.get("is_codex_backend") is True
+            and is_official_codex_base_url(kwargs.get("base_url") or "")
+            and self._last_issuer_model == "gpt-6-astra"
+        )
         return _chat_messages_to_responses_input(
             messages, is_xai_responses=kwargs.get("is_xai_responses") is True,
             is_github_responses=kwargs.get("is_github_responses") is True,
             replay_encrypted_reasoning=bool(kwargs.get("replay_encrypted_reasoning", True)),
             current_issuer_kind=self._resolve_issuer_kind(kwargs),
             current_issuer_model=self._last_issuer_model,
-            native_compaction_eligible=_native_compaction_active(kwargs.get("context_management")),
+            native_compaction_eligible=(_native_compaction_active(kwargs.get("context_management"))
+                                        or sol_checkpoint_replay),
+            approved_sol_pair="continuation" if sol_checkpoint_replay else None,
         )
 
     def convert_tools(self, tools: Optional[list[dict[str, Any]]]) -> Any:
@@ -715,6 +725,8 @@ class ResponsesApiTransport(ProviderTransport):
                 payload_messages, is_xai_responses=is_xai_responses, is_github_responses=is_github_responses,
                 replay_encrypted_reasoning=replay_encrypted_reasoning, base_url=params.get("base_url"),
                 is_codex_backend=is_codex_backend, context_management=context_management, model=wire_model,
+                provider=params.get("provider"),
+                sol_checkpoint_replay=params.get("sol_checkpoint_replay") is True,
             ),
             "store": False,
         }

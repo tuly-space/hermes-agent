@@ -276,6 +276,10 @@ class CompressionFacadeMixin:
                 fence_stack.append(registration)
                 self._active_compression_commit_fence = active_fence
 
+            from agent.native_maintenance import _has_pending_tool_call
+            if _has_pending_tool_call(messages):
+                return messages, system_message
+
             if not force and not focus_topic and not getattr(self, "_native_idle_summary_fallback", False):
                 from agent.native_maintenance import attempt, before_summary
                 if before_summary(self, messages):
@@ -286,6 +290,7 @@ class CompressionFacadeMixin:
                             # Post-tool/pre-API calls flush their tail before checkpointing.
                             if db is not None and sid and getattr(self, "_active_session_turn_lease_holder", None):
                                 if self._flush_messages_to_session_db(messages) is False:
+                                    self._native_maintenance_abort_fallback = True
                                     raise RuntimeError("Native maintenance input could not be persisted")
                             watermark = db.get_active_message_watermark(sid) if db is not None and sid else None
                             native_ok = attempt(
@@ -295,11 +300,14 @@ class CompressionFacadeMixin:
                                 commit_fence=active_fence,
                             )
                         except Exception:
-                            logger.warning("Native pre-summary attempt failed; using ordinary compression", exc_info=True)
+                            self._native_maintenance_abort_fallback = True
+                            logger.warning("Native pre-summary snapshot failed; preserving raw history", exc_info=True)
                             native_ok = False
                         if native_ok:
                             self._native_maintenance_committed = True
                             return list(messages), getattr(self, "_cached_system_prompt", None) or system_message
+                        if getattr(self, "_native_maintenance_abort_fallback", False):
+                            return messages, system_message
             # A revoked hygiene/interrupt fence also forbids the summary fallback.
             if active_fence.is_cancelled:
                 return messages, system_message

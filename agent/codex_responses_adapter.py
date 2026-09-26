@@ -390,9 +390,10 @@ def _assistant_message_item(
 def _replay_reasoning_items(
     msg: Dict[str, Any], *, seen_item_ids: set, current_issuer_kind: Optional[str],
     current_issuer_model: Optional[str] = None, native_compaction_eligible: bool,
+    approved_sol_pair: Optional[str] = None, preserve_reasoning: bool = True,
 ) -> List[Dict[str, Any]]:
     """Replay persisted encrypted reasoning/compaction items for one assistant turn. Skips duplicate
-    ids, ``compaction`` checkpoints unless THIS request carries ``context_management`` (else a persisted
+    ids, ``compaction`` checkpoints unless THIS request has verified replay eligibility (else a persisted
     checkpoint erases pre-checkpoint history on a model that cannot decrypt it), and items stamped by
     another issuer or model (HTTP 400). Items without a model stamp (legacy or unstamped) replay on a
     matching issuer. ``id`` (store=False lookups 404) and the Hermes provenance fields are stripped."""
@@ -400,6 +401,8 @@ def _replay_reasoning_items(
     replayed: List[Dict[str, Any]] = []
     for ri in _as_list(msg.get("codex_reasoning_items")):
         if not (isinstance(ri, dict) and ri.get("encrypted_content")):
+            continue
+        if ri.get("type") == "reasoning" and not preserve_reasoning:
             continue
         item_id = ri.get("id")
         if (item_id and item_id in seen_item_ids) or (ri.get("type") == "compaction" and not native_compaction_eligible):
@@ -413,6 +416,17 @@ def _replay_reasoning_items(
         foreign_model = (
             current_issuer_model is not None and item_model is not None and item_model != current_issuer_model
         )
+        if foreign_model and item_issuer == current_issuer_kind == "codex_backend":
+            paired_reasoning = (
+                approved_sol_pair == "maintenance" and preserve_reasoning
+                and ri.get("type") == "reasoning" and item_model == "gpt-6-astra"
+                and current_issuer_model == "gpt-6-sol"
+            )
+            paired_checkpoint = (
+                approved_sol_pair == "continuation" and ri.get("type") == "compaction"
+                and item_model == "gpt-6-sol" and current_issuer_model == "gpt-6-astra"
+            )
+            foreign_model = not (paired_reasoning or paired_checkpoint)
         if foreign_issuer or foreign_model:
             if not _CROSS_ISSUER_WARN_EMITTED:
                 logger.warning(
@@ -538,6 +552,7 @@ def _chat_messages_to_responses_input(
     messages: List[Dict[str, Any]], *, is_xai_responses: bool = False, is_github_responses: bool = False,
     replay_encrypted_reasoning: bool = True, current_issuer_kind: Optional[str] = None,
     current_issuer_model: Optional[str] = None, native_compaction_eligible: bool = False,
+    approved_sol_pair: Optional[str] = None, preserve_reasoning: bool = True,
 ) -> List[Dict[str, Any]]:
     """Convert internal chat-style messages to Responses input items.
 
@@ -547,8 +562,9 @@ def _chat_messages_to_responses_input(
     ``is_github_responses``: drops ``id`` from replayed message items (Copilot 401s on stale ids).
     ``current_issuer_kind`` / ``current_issuer_model``: provenance guard; items stamped by another issuer or
     model drop. Legacy items carrying only an endpoint stamp replay on a matching issuer.
-    ``native_compaction_eligible``: THIS request carries ``context_management``; gates both replaying ``compaction``
-    checkpoints and ``prune_pre_checkpoint_items``. Checkpoints persist across model swaps / compression flips / resume,
+    ``native_compaction_eligible``: THIS request may replay a verified checkpoint, either because it carries
+    ``context_management`` or because it is an approved Sol-checkpoint Astra continuation. It gates both
+    checkpoint replay and ``prune_pre_checkpoint_items``. Checkpoints persist across model swaps / compression flips / resume,
     so without the gate one checkpoint would erase pre-checkpoint history on a model that cannot decrypt it (lossless:
     local history is never truncated).
 
@@ -563,15 +579,14 @@ def _chat_messages_to_responses_input(
     invalidate it — and rejects a stale id with HTTP 401 "input item ID does not belong to this connection"
     even for short ids (see #32716). ``phase``/ ``status``/``content`` are still replayed; only ``id`` is
     unsafe to reuse across a Copilot connection.
-    ``native_compaction_eligible`` mirrors, for THIS request, the decision made by
-    ``native_compaction.native_compaction_context_management`` — it is True only when that gate returned a
-    payload, i.e. when the request actually carries ``context_management``. It controls two things that must
+    ``native_compaction_eligible`` mirrors, for THIS request, either the native generation gate
+    or the verified Sol-checkpoint replay gate. It controls two things that must
     never outlive the gate: replaying ``type: "compaction"`` checkpoint items, and restructuring the wire
     around them (``prune_pre_checkpoint_items``). Checkpoints are persisted in the ``codex_reasoning_items``
     sidecar and survive a mid-session model swap, a ``compression.enabled: false`` flip, the rejection kill
     switch and a resumed session; without this flag a single captured checkpoint would keep deleting every
     pre-checkpoint item from every later request, on a model that cannot decrypt the blob (#85914). Default
-    False = pre-feature wire, which is also correct for every caller that never sends ``context_management``
+    False = pre-feature wire, which is also correct for callers without either gate
     (auxiliary/compression client, ad-hoc ``convert_messages``). Dropping the checkpoint costs nothing:
     Hermes' local history is never truncated by native compaction, so the full conversation is still on the
     wire.
@@ -621,6 +636,7 @@ def _chat_messages_to_responses_input(
         reasoning_items = [] if not replay_encrypted_reasoning else _replay_reasoning_items(
             msg, seen_item_ids=seen_item_ids, current_issuer_kind=current_issuer_kind,
             current_issuer_model=current_issuer_model, native_compaction_eligible=native_compaction_eligible,
+            approved_sol_pair=approved_sol_pair, preserve_reasoning=preserve_reasoning,
         )
         # Maintenance can cover a completed tool/user tail while its durable
         # sidecar lives on the preceding assistant. Reposition the checkpoint
@@ -715,9 +731,10 @@ def _native_responses_replay_items(
     if getattr(agent, "api_mode", None) != "codex_responses" or not isinstance(messages, list):
         return None
     route = classify_responses_route(agent)._asdict()
-    from agent.native_compaction import native_compaction_context_management
+    from agent.native_compaction import native_compaction_context_management, sol_native_route
     from agent.fast_mode import effective_request_overrides
-    if not native_compaction_context_management(agent, **route):
+    sol_replay = sol_native_route(agent)
+    if not sol_replay and not native_compaction_context_management(agent, **route):
         return None
     # The wire model may be rewritten per request (fast mode); provenance must match what the transport stamps.
     effective_model = effective_request_overrides(agent).get("model", getattr(agent, "model", None))
@@ -728,6 +745,7 @@ def _native_responses_replay_items(
             current_issuer_kind=_classify_responses_issuer(base_url=getattr(agent, "base_url", None), **route),
             current_issuer_model=_wire_model_identity(effective_model),
             native_compaction_eligible=True,
+            approved_sol_pair="continuation" if sol_replay else None,
         )
     except Exception:
         logger.debug(

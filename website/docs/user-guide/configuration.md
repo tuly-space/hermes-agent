@@ -1009,6 +1009,8 @@ auxiliary:
     model: ""                                       # Empty = use main chat model. Override with e.g. "google/gemini-3-flash-preview" for cheaper/faster compression.
     provider: "auto"                                # Provider: "auto", "openrouter", "nous", "codex", "main", etc.
     base_url: null                                  # Custom OpenAI-compatible endpoint (overrides provider)
+    native: false                                   # Explicit false uses ordinary summaries; omitted preserves legacy native behavior
+    preserve_reasoning: false                      # With native true, retain encrypted prior reasoning on the supported Codex route
 ```
 
 :::info Legacy config migration
@@ -1058,6 +1060,19 @@ compression:
   threshold: 0.50
 ```
 Uses your main provider and main model. Override per-task (e.g. `auxiliary.compression.provider: openrouter` + `model: google/gemini-2.5-flash`) if you want compression on a cheaper model than your main chat model.
+
+For an official Codex OAuth session on `gpt-6-astra`, this opt-in uses Sol for native maintenance while normal turns stay on Astra:
+
+```yaml
+auxiliary:
+  compression:
+    provider: openai-codex
+    model: gpt-6-sol
+    native: true
+    preserve_reasoning: true
+```
+
+`native: true` requires the current official Codex endpoint and account; unsupported auxiliary routes use ordinary summarization. `preserve_reasoning: true` replays opaque encrypted reasoning into maintenance, while `false` keeps messages and tool results without that reasoning. Normal Astra continuation replays a saved Sol checkpoint without requesting Astra native generation. Global compression and checkpoint gates still apply. Missing `native` leaves the legacy native settings in effect; explicit `false` selects ordinary summarization.
 
 **Force a specific provider** (OAuth or API-key based):
 ```yaml

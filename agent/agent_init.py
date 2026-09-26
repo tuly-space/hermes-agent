@@ -2001,6 +2001,24 @@ def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_c
     agent.max_compression_attempts = cs.max_attempts
     agent.compression_idle_compact_after_seconds = cs.idle_compact_after_seconds
     agent.compression_native_first = cs.codex_responses_native_first
+    auxiliary_compression = _cfg_dict(_cfg_dict(_agent_cfg, "auxiliary"), "compression")
+    # Missing is distinct from explicit false: existing native settings retain their behavior.
+    agent.compression_aux_native = (
+        is_truthy_value(auxiliary_compression["native"])
+        if "native" in auxiliary_compression else None
+    )
+    agent.compression_aux_preserve_reasoning = is_truthy_value(
+        auxiliary_compression.get("preserve_reasoning"), default=False
+    )
+    agent.compression_aux_provider = auxiliary_compression.get("provider")
+    agent.compression_aux_model = auxiliary_compression.get("model")
+    agent.compression_aux_base_url = auxiliary_compression.get("base_url")
+    if session_db is not None and agent.session_id:
+        agent._sol_native_replay_disabled = bool(session_db.get_session_model_config_value(
+            agent.session_id, "sol_native_replay_disabled", False
+        ))
+        if agent._sol_native_replay_disabled:
+            agent._codex_reasoning_replay_enabled = False
     agent.compression_native_idle_after_seconds = cs.codex_responses_native_idle_after_seconds
     agent.compression_native_idle_min_tokens = cs.codex_responses_native_idle_min_tokens
 

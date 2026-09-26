@@ -63,6 +63,24 @@ def is_native_compaction_model(
     )
 
 
+def sol_native_route(agent: Any) -> bool:
+    """The one verified cross-model Codex route, without trusting a provider override."""
+    return bool(
+        getattr(agent, "compression_aux_native", None) is True
+        and not getattr(agent, "_sol_native_replay_disabled", False)
+        and getattr(agent, "api_mode", None) == "codex_responses"
+        and getattr(agent, "provider", None) == "openai-codex"
+        and is_official_codex_base_url(getattr(agent, "base_url", "") or "")
+        and getattr(agent, "model", None) == "gpt-6-astra"
+        and getattr(agent, "compression_aux_provider", None) == "openai-codex"
+        and getattr(agent, "compression_aux_model", None) == "gpt-6-sol"
+        and not getattr(agent, "compression_aux_base_url", None)
+        and getattr(agent, "compression_enabled", True)
+        and not getattr(agent, "compression_checkpoint_required", False)
+        and getattr(agent, "_codex_reasoning_replay_enabled", True)
+    )
+
+
 def resolve_native_compaction_capabilities(
     *, model: Optional[str], base_url: Optional[str], provider: Optional[str] = None, is_codex_backend: bool = False,
 ) -> Dict[str, bool]:
@@ -136,6 +154,9 @@ def native_compaction_context_management(agent: Any, *, is_codex_backend: bool, 
     Every gate is re-checked per request so a mid-session model switch or the in-session
     kill switch (``agent.codex_responses_native_compaction = False``) takes effect next call.
     """
+    if getattr(agent, "compression_aux_native", None) is not None:
+        # Explicit false selects ordinary summaries; true generates only through Sol maintenance.
+        return None
     capabilities = getattr(agent, "runtime_capabilities", None)
     if isinstance(capabilities, dict) and not capabilities.get("native_compaction", False):
         return None

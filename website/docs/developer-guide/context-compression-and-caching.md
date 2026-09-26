@@ -464,6 +464,29 @@ usable local trigger exists, automatic mode uses 200,000. The provider minimum
 is 1,024 tokens, so an unusually small local trigger at or below that floor
 cannot preserve strict native first ordering.
 
+### Codex Sol maintenance for Astra sessions
+
+`auxiliary.compression.native: true` with `provider: openai-codex` and
+`model: gpt-6-sol` selects the existing checkpoint-only maintenance call on an
+official Codex OAuth Astra session. The maintenance request uses the current
+session's endpoint, credential, instructions, tools, and cache scope, but its
+wire model is Sol. The full frozen transcript is sent to `/responses` with a
+low forced inline compaction threshold; raw SessionDB messages remain intact.
+Its encrypted checkpoint carries the truthful Sol issuer stamp, covered-row
+watermark and prefix digest, and is attached through SessionDB's compare-and-set.
+
+Normal Astra requests replay the approved Sol checkpoint without sending
+`context_management`, so this setting never asks Astra to generate a new native
+checkpoint. With `preserve_reasoning: true`, maintenance also forwards actual
+encrypted Astra reasoning items; with `false`, it keeps checkpoints, messages,
+tool calls and results while omitting prior reasoning. No encrypted item is
+rendered as summary text. The cross-model exception is restricted to this
+official Astra/Sol pair. A rejected encrypted item disables native replay in
+the session's existing model config, so a cold resume uses raw history and
+ordinary compression. Missing `native` retains the legacy behavior above;
+explicit `false` uses ordinary summarization. Global compression, checkpoint,
+route and cancellation gates still apply.
+
 ### Computed Values (for a 200K context model at defaults)
 
 ```

@@ -147,6 +147,18 @@ class TestExtractCacheBustingConfig:
     """Verify _extract_cache_busting_config pulls the documented subset of
     config values that must invalidate the cached agent on change."""
 
+    def test_auxiliary_native_change_rebuilds_agent(self):
+        from gateway.run import GatewayRunner
+
+        runtime = {"api_key": "session-key", "base_url": "https://chatgpt.com/backend-api/codex",
+                   "provider": "openai-codex", "api_mode": "codex_responses"}
+        def signature(native):
+            keys = GatewayRunner._extract_cache_busting_config({"auxiliary": {"compression": {
+                "provider": "openai-codex", "model": "gpt-6-sol", "native": native,
+                "preserve_reasoning": True}}})
+            return GatewayRunner._agent_config_signature("gpt-6-astra", runtime, [], "", cache_keys=keys)
+        assert signature(True) != signature(False)
+
 
     def test_reads_compression_subkeys(self):
         from gateway.run import GatewayRunner

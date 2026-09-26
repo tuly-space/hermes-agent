@@ -83,6 +83,23 @@ def test_live_codex_native_compaction_applies_on_next_turn(monkeypatch):
     assert session["agent"].codex_responses_native_compaction is True
 
 
+def test_live_auxiliary_native_route_applies_and_unset_restores_legacy(monkeypatch):
+    session, _ = _session_with_compressor()
+    cfg = {"auxiliary": {"compression": {
+        "provider": "openai-codex", "model": "gpt-6-sol",
+        "native": True, "preserve_reasoning": True}}}
+    monkeypatch.setattr(server, "_load_cfg", lambda: cfg)
+    server._sync_agent_compression_with_config("sid-95151", session)
+    agent = session["agent"]
+    assert agent.compression_aux_native is True
+    assert agent.compression_aux_preserve_reasoning is True
+    assert agent.compression_aux_model == "gpt-6-sol"
+    cfg["auxiliary"]["compression"] = {}
+    server._sync_agent_compression_with_config("sid-95151", session)
+    assert agent.compression_aux_native is None
+    assert agent.compression_aux_preserve_reasoning is False
+
+
 def test_live_codex_native_threshold_applies_on_next_turn(monkeypatch):
     session, _ = _session_with_compressor()
 

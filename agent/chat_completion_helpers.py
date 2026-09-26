@@ -1376,6 +1376,8 @@ def _build_codex_kwargs(agent, api_messages, tools_for_api, reasoning_config, re
     # only) — None on every other route/model, leaving the request unchanged.
     context_management = native_compaction_context_management(agent, is_codex_backend=is_codex_backend,
         is_xai_responses=is_xai_responses, is_github_responses=is_github_responses)
+    from agent.native_compaction import sol_native_route
+    sol_checkpoint_replay = sol_native_route(agent)
     # xAI's /responses endpoint 400s on ``pattern``/``format`` schema keywords and on
     # ``enum`` values containing ``/`` — strip them (#27197). Deep-copy first: the
     # sanitizers mutate in place and tools_for_api aliases agent.tools (#27907).
@@ -1399,7 +1401,8 @@ def _build_codex_kwargs(agent, api_messages, tools_for_api, reasoning_config, re
         is_codex_backend=is_codex_backend, is_xai_responses=is_xai_responses,
         github_reasoning_extra=agent._github_models_reasoning_extra_body() if is_github_responses else None,
         replay_encrypted_reasoning=bool(getattr(agent, "_codex_reasoning_replay_enabled", True)),
-        context_management=context_management, text_verbosity=getattr(agent, "text_verbosity", None))
+        context_management=context_management, sol_checkpoint_replay=sol_checkpoint_replay,
+        text_verbosity=getattr(agent, "text_verbosity", None))
 
 
 

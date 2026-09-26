@@ -53,7 +53,7 @@ class GatewayAgentCacheMixin:
         out: Dict[str, Any] = {}
         cfg = user_config if isinstance(user_config, dict) else {}
         for section, key in cls._CACHE_BUSTING_CONFIG_KEYS:
-            section_val = cfg.get(section)
+            section_val = cfg_get(cfg, *section.split("."), default=None)
             if section == "checkpoints" and isinstance(section_val, bool):
                 # Legacy ``checkpoints: true``: a live toggle must still rebuild the cached agent.
                 out[f"{section}.{key}"] = section_val if key == "enabled" else None

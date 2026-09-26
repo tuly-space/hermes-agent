@@ -4394,6 +4394,9 @@ class GatewayRunner(
         ("compression", "proactive_prune_min_result_chars"),
         ("compression", "proactive_prune_min_reclaim_tokens"),
         ("compression", "min_tail_user_messages"), ("agent", "disabled_toolsets"),
+        ("auxiliary.compression", "provider"), ("auxiliary.compression", "model"),
+        ("auxiliary.compression", "base_url"), ("auxiliary.compression", "native"),
+        ("auxiliary.compression", "preserve_reasoning"),
         ("memory", "provider"), ("checkpoints", "enabled"), ("checkpoints", "max_snapshots"),
         ("checkpoints", "max_total_size_mb"), ("checkpoints", "max_file_size_mb"))
 
