@@ -3625,7 +3625,6 @@ def _commit_compaction(
                     agent.session_id, compressed, model_config_patch={PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: None},
                     watermark=lease.watermark, lock_holder=lease.holder,
                     tail_count=sum(1 for m in compressed if id(m) in _tail_tagged_ids),
-                    exact_watermark=getattr(agent, "_native_idle_fallback_watermark", None),
                 )
                 split_status = "in_place_committed"
                 # compress() returned marker-swept copies; stamp them as persisted or the next

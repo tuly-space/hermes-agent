@@ -85,7 +85,7 @@ _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"|skipping\s+concurrent\s+compression"
     rf"|{re.escape(COMPACTION_STATUS)}"
     rf"|{re.escape(COMPACTION_HEARTBEAT_STATUS)}"
-    r"|resumed\s+after\s+\d+s\s+idle\s+[—-]\s+compacting"
+    # The existing idle-resume status is user-visible when a cold turn compacts.
     r"|preflight\s+compression"
     r"|pre[- ]api\s+compression"
     # Retry chatter via _emit_status; ", retrying"/"— compressing" anchors exclude manual /compress feedback.

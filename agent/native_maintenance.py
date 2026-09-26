@@ -8,14 +8,10 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import threading
 import time
 from typing import Any
 
 logger = logging.getLogger(__name__)
-IDLE_MIN_INPUT_TOKENS = 80_000
-IDLE_MIN_GROWTH_TOKENS = 16_384
-_IDLE_KEY = "native_idle_maintenance"
 
 
 def _prefix_digest(messages: list[dict]) -> str:
@@ -56,8 +52,7 @@ def _usage(usage: Any) -> tuple[Any, Any, Any]:
 
 def attempt(agent: Any, messages: list[dict], system_prompt: str, before_tokens: int,
             *, phase: str, expected_watermark: int | None = None,
-            turn_lease_holder: str | None = None, commit_fence: Any = None,
-            on_idle_start: Any = None) -> bool:
+            turn_lease_holder: str | None = None, commit_fence: Any = None) -> bool:
     """Try a forced inline /responses checkpoint; return False for *any* non-commit.
 
     A maintenance request must not use /responses/compact (404 on Codex OAuth).
@@ -157,7 +152,11 @@ def attempt(agent: Any, messages: list[dict], system_prompt: str, before_tokens:
         # suffix makes an assistant/tool-ended transcript a closed, inert request.
         kwargs["input"] = list(kwargs["input"]) + [{"role": "user", "content":
             "Prepare the handoff. Reply only READY."}]
-        kwargs["timeout"] = min(float(kwargs.get("timeout") or 300), 300.0)
+        if sol_route:
+            from agent.auxiliary_client import _effective_aux_timeout
+            kwargs["timeout"] = _effective_aux_timeout("compression", None)
+        else:
+            kwargs["timeout"] = min(float(kwargs.get("timeout") or 300), 300.0)
         kwargs = agent._get_transport().preflight_kwargs(
             kwargs, allow_stream=True, is_github_responses=route.is_github_responses,
             sanitize_harmony_tokens=route.is_codex_backend,
@@ -165,14 +164,6 @@ def attempt(agent: Any, messages: list[dict], system_prompt: str, before_tokens:
         kwargs = _sanitize_consumer_codex_request(agent, kwargs)
         kwargs["stream"] = True
         client = agent._create_request_openai_client(reason="native_maintenance", api_kwargs=kwargs)
-        if phase == "idle":
-            agent._native_idle_client = client
-            if getattr(agent, "_native_idle_cancel", threading.Event()).is_set():
-                reason = "new_turn_or_shutdown"
-                agent._native_maintenance_abort_fallback = True
-                return False
-            if on_idle_start is not None:
-                on_idle_start()
         stream = client.responses.create(**bypass_sdk_request_transform(kwargs))
         terminal_seen = False
         def _terminal_event(event):
@@ -192,10 +183,6 @@ def attempt(agent: Any, messages: list[dict], system_prompt: str, before_tokens:
                     checkpoints.append(encrypted)
         if not checkpoints:
             return False
-        if phase == "idle" and getattr(agent, "_native_idle_cancel", threading.Event()).is_set():
-            reason = "new_turn_or_shutdown"
-            agent._native_maintenance_abort_fallback = True
-            return False
         checkpoint = {
             "type": "compaction", "encrypted_content": checkpoints[-1],
             "_issuer_kind": _classify_responses_issuer(
@@ -206,8 +193,7 @@ def attempt(agent: Any, messages: list[dict], system_prompt: str, before_tokens:
             checkpoint["_checkpoint_watermark"] = expected_watermark
             checkpoint["_checkpoint_count"] = len(covered)
             checkpoint["_checkpoint_prefix_digest"] = _prefix_digest(covered)
-        if commit_fence is not None and not commit_fence.begin_commit(
-                getattr(agent, "_native_idle_cancel", None) if phase == "idle" else None):
+        if commit_fence is not None and not commit_fence.begin_commit():
             reason = "commit_admission_revoked"
             agent._native_maintenance_abort_fallback = True
             return False
@@ -228,38 +214,19 @@ def attempt(agent: Any, messages: list[dict], system_prompt: str, before_tokens:
                     agent._native_maintenance_abort_fallback = True
                     return False
             # Only mutate the in-memory sidecar AFTER the durable CAS succeeded.
-            # An idle turn may have been admitted immediately after that transaction;
-            # its DB reload wins, rather than rewriting its live list behind its back.
-            if phase != "idle" or not getattr(agent, "_native_idle_cancel", threading.Event()).is_set():
-                carrier["codex_reasoning_items"] = list(carrier.get("codex_reasoning_items") or []) + [checkpoint]
-            if phase == "idle" and not getattr(agent, "_native_idle_cancel", threading.Event()).is_set():
-                live = getattr(agent, "_session_messages", None)
-                if isinstance(live, list):
-                    for m in reversed(live):
-                        if m.get("role") == "assistant" and m.get("_row_id") == row_id:
-                            m["codex_reasoning_items"] = list(m.get("codex_reasoning_items") or []) + [checkpoint]
-                            break
+            carrier["codex_reasoning_items"] = list(carrier.get("codex_reasoning_items") or []) + [checkpoint]
         finally:
             if commit_fence is not None:
                 commit_fence.finish_commit()
-        # A foreground turn may start immediately after the durable CAS. It will
-        # reload the checkpoint itself; never rewrite its live usage state afterward.
-        update_local = phase != "idle" or not getattr(agent, "_native_idle_cancel", threading.Event()).is_set()
-        if update_local:
-            try:
-                note = getattr(agent.context_compressor, "note_native_compaction_checkpoint", None)
-                if callable(note):
-                    note()
-                from agent.usage_anchor import set_usage_anchor
-                set_usage_anchor(agent, None)
-            except Exception:
-                logger.warning("Native checkpoint committed but local usage latch failed", exc_info=True)
-            agent._native_maintenance_pending_followup = phase
-        if phase != "idle" and db is not None and sid and isinstance(expected_watermark, int):
-            try:
-                db.patch_session_model_config(sid, {_IDLE_KEY: {"model": agent.model, "pressure": before_tokens}})
-            except Exception:
-                logger.warning("Native checkpoint committed but growth baseline write failed", exc_info=True)
+        try:
+            note = getattr(agent.context_compressor, "note_native_compaction_checkpoint", None)
+            if callable(note):
+                note()
+            from agent.usage_anchor import set_usage_anchor
+            set_usage_anchor(agent, None)
+        except Exception:
+            logger.warning("Native checkpoint committed but local usage latch failed", exc_info=True)
+        agent._native_maintenance_pending_followup = phase
         outcome, reason = "native", "checkpoint_committed"
         return True
     except Exception as exc:
@@ -267,8 +234,6 @@ def attempt(agent: Any, messages: list[dict], system_prompt: str, before_tokens:
         logger.warning("Native maintenance failed (%s, session=%s, reason=%s)", phase, sid, reason, exc_info=True)
         return False
     finally:
-        if phase == "idle" and getattr(agent, "_native_idle_client", None) is client:
-            agent._native_idle_client = None
         if stream is not None:
             close = getattr(stream, "close", None)
             if callable(close):
@@ -285,191 +250,3 @@ def attempt(agent: Any, messages: list[dict], system_prompt: str, before_tokens:
             phase, outcome, reason, sid, before_tokens, after_estimate,
             input_tokens, cached_tokens, output_tokens, time.monotonic() - started,
         )
-
-
-def _idle_pressure(agent: Any, messages: list[dict]) -> int:
-    from agent.codex_responses_adapter import has_replayable_native_compaction_checkpoint
-    from agent.usage_anchor import anchored_context_tokens
-    anchored = anchored_context_tokens(messages, getattr(agent, "_usage_anchor", None))
-    if anchored is not None:
-        return anchored
-    if has_replayable_native_compaction_checkpoint(agent, messages):
-        # Encrypted checkpoint size is not provider token usage. Wait for an
-        # actual normal follow-up to price the full post-checkpoint request.
-        return 0
-    from agent.turn_context import _preflight_request_tokens
-    return _preflight_request_tokens(agent, messages, getattr(agent, "_cached_system_prompt", "") or "")
-
-
-def idle_delegation_blocked(db: Any, sid: str) -> bool:
-    """Fail closed on this profile's durable parent ownership, including unacknowledged results."""
-    try:
-        return db._read_one("""SELECT 1 FROM async_delegations
-            WHERE parent_session_id = ?
-              AND (state IN ('running', 'finalizing') OR delivery_state = 'pending')
-            LIMIT 1""", (sid,)) is not None
-    except Exception:
-        logger.warning("Idle delegation ledger unavailable for session=%s; skipping", sid, exc_info=True)
-        return True
-
-
-def arm_idle(agent: Any, result: Any) -> None:
-    """Persist gateway turns; retain the local timer for non-gateway agents."""
-    seconds = getattr(agent, "compression_native_idle_after_seconds", 0)
-    db, sid = getattr(agent, "_session_db", None), getattr(agent, "session_id", None)
-    if (not seconds or not eligible(agent) or db is None or not sid
-            or getattr(agent, "_persist_disabled", False)
-            or not isinstance(result, dict) or not result.get("completed")):
-        return
-    key = str(getattr(agent, "_gateway_session_key", None) or "")
-    if not key:
-        from agent.periodic_scheduler import schedule
-        cancel_idle(agent, timetable=False)
-        generation = threading.Event()
-        agent._native_idle_cancel = generation
-        agent._native_idle_handle = schedule(lambda: _idle_tick(agent, sid, generation), seconds)
-        return
-    from agent.idle_timetable import for_home
-    from pathlib import Path
-    for_home(Path(db.db_path).parent).update(sid, key, time.time(), seconds)
-
-
-def cancel_idle(agent: Any, *, timetable: bool = True) -> None:
-    if (timetable and getattr(agent, "_gateway_session_key", None)
-            and getattr(agent, "compression_native_idle_after_seconds", 0) > 0
-            and eligible(agent)
-            and not getattr(agent, "_native_idle_owned_by_scheduler", False)
-            and getattr(agent, "session_id", None) and getattr(agent, "_session_db", None)):
-        from pathlib import Path
-        from agent.idle_timetable import for_home
-        try:
-            for_home(Path(agent._session_db.db_path).parent).cancel(agent.session_id)
-        except Exception:
-            # A corrupt/full timetable must never prevent the foreground turn;
-            # the DB watermark/lease still fences a late idle commit.
-            logger.warning("Could not invalidate idle timetable for %s", agent.session_id, exc_info=True)
-    cancellation = getattr(agent, "_native_idle_cancel", None)
-    if cancellation is not None:
-        cancellation.set()
-    fence = getattr(agent, "_native_idle_fence", None)
-    if fence is not None:
-        fence.revoke_commit_admission()
-        fence.try_cancel_before_commit()
-    client = getattr(agent, "_native_idle_client", None)
-    if client is not None:
-        agent._abort_request_openai_client(client, reason="native_idle_superseded")
-    handle = getattr(agent, "_native_idle_handle", None)
-    agent._native_idle_handle = None
-    if handle is not None and hasattr(handle, "cancel"):
-        handle.cancel()
-
-
-def _idle_tick(agent: Any, sid: str, generation: threading.Event | None = None) -> bool:
-    """One bounded idle pass; zero-wait cross-process lease, fresh snapshot, no chat."""
-    db = getattr(agent, "_session_db", None)
-    generation = generation or getattr(agent, "_native_idle_cancel", None)
-    if (generation is None or generation.is_set() or generation is not getattr(agent, "_native_idle_cancel", None)
-            or db is None or sid != getattr(agent, "session_id", None) or not eligible(agent)
-            or getattr(agent, "compression_native_idle_after_seconds", 0) <= 0):
-        return False
-    if idle_delegation_blocked(db, sid):
-        return False
-    try:
-        if (sid != getattr(agent, "session_id", None)
-                or getattr(agent, "_native_idle_handle", None) is None
-                or generation.is_set() or generation is not getattr(agent, "_native_idle_cancel", None)):
-            return False
-        messages = db.get_messages_as_conversation(sid, repair_alternation=True, include_row_ids=True)
-        if not messages or messages[-1].get("role") != "assistant":
-            return False
-        pressure = _idle_pressure(agent, messages)
-        compressor = agent.context_compressor
-        minimum = getattr(agent, "compression_native_idle_min_tokens", IDLE_MIN_INPUT_TOKENS)
-        if (pressure < minimum
-                or getattr(compressor, "context_length", 0) < minimum
-                or getattr(compressor, "awaiting_real_usage_after_compression", False)):
-            return False
-        previous = db.get_session_model_config_value(sid, _IDLE_KEY, None)
-        if (isinstance(previous, dict) and previous.get("model") == agent.model
-                and pressure < previous.get("pressure", 0) + IDLE_MIN_GROWTH_TOKENS):
-            return False
-        watermark = db.get_active_message_watermark(sid)
-        # The network request never owns the session turn lease. The short
-        # transactional checkpoint CAS rejects a foreground lease or moved tail.
-        db.patch_session_model_config(sid, {_IDLE_KEY: {"model": agent.model, "pressure": pressure}})
-        from agent.conversation_compression import CompressionCommitFence
-        fence = CompressionCommitFence(total_ceiling_seconds=300)
-        agent._native_idle_fence = fence
-        # A single admission notice per pass, shared by native and summary fallback.
-        # Capture the gateway's destination before any later turn rebinds the cached agent.
-        notify = getattr(agent, "_native_idle_start_callback", None)
-        notified = False
-        def on_idle_start():
-            nonlocal notified
-            if (notified or generation.is_set()
-                    or generation is not getattr(agent, "_native_idle_cancel", None)):
-                return
-            notified = True
-            if callable(notify):
-                try:
-                    notify()
-                except Exception:
-                    logger.debug("Native idle start notice failed: session=%s", sid, exc_info=True)
-        try:
-            ok = attempt(agent, messages, getattr(agent, "_cached_system_prompt", "") or "", pressure,
-                         phase="idle", expected_watermark=watermark, commit_fence=fence,
-                         on_idle_start=on_idle_start)
-        finally:
-            if getattr(agent, "_native_idle_fence", None) is fence:
-                agent._native_idle_fence = None
-        if not ok and not getattr(agent, "_native_maintenance_abort_fallback", False) and not generation.is_set():
-            return _ordinary_idle_fallback(agent, messages, sid, watermark, generation, pressure,
-                                           on_idle_start=on_idle_start)
-        return bool(ok)
-    except Exception:
-        logger.warning("Native idle maintenance declined for session=%s", sid, exc_info=True)
-        return False
-
-
-def _ordinary_idle_fallback(agent: Any, messages: list[dict], sid: str, watermark: int,
-                            generation: threading.Event, pressure: int, *, on_idle_start: Any = None) -> bool:
-    """Use the existing in-place compressor, never rotate or publish a stale idle result."""
-    db = agent._session_db
-    if (generation.is_set() or generation is not getattr(agent, "_native_idle_cancel", None)
-            or db.get_active_message_watermark(sid) != watermark
-            or not getattr(agent, "compression_in_place", True)):
-        return False
-    from agent.conversation_compression import CompressionCommitFence
-    fence = CompressionCommitFence(total_ceiling_seconds=300)
-    agent._native_idle_fence = fence
-    agent._native_idle_summary_fallback = True
-    agent._native_idle_fallback_watermark = watermark
-    try:
-        # archive_and_compact holds its own durable compression lock; its
-        # transactional exact-watermark + turn-lease guard fences the commit.
-        if generation.is_set() or generation is not getattr(agent, "_native_idle_cancel", None):
-            return False
-        if on_idle_start is not None:
-            on_idle_start()
-        compressed, _ = agent._compress_context(
-            messages, getattr(agent, "_cached_system_prompt", "") or "",
-            approx_tokens=pressure, commit_fence=fence, force=True,
-        )
-        if compressed is messages or not getattr(agent, "_last_compaction_in_place", False):
-            return False
-        # TUI keeps this exact list as its next-turn history; gateway reloads DB.
-        live = getattr(agent, "_session_messages", None)
-        if isinstance(live, list) and not generation.is_set():
-            live[:] = compressed
-        if not generation.is_set():
-            agent._native_maintenance_pending_followup = "idle_summary"
-        logger.info("Native idle ordinary fallback committed in place: session=%s", sid)
-        return True
-    except Exception:
-        logger.warning("Native idle ordinary fallback failed: session=%s", sid, exc_info=True)
-        return False
-    finally:
-        if getattr(agent, "_native_idle_fence", None) is fence:
-            agent._native_idle_fence = None
-        agent._native_idle_summary_fallback = False
-        agent._native_idle_fallback_watermark = None

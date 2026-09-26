@@ -653,8 +653,6 @@ DEFAULT_CONFIG = {
         # api.openai.com or the Codex backend; local compression stays as fallback.
         "codex_responses_native": False,
         "codex_responses_native_first": False,
-        "codex_responses_native_idle_after_seconds": 0,
-        "codex_responses_native_idle_min_tokens": 80000,
         # Absolute server compaction trigger (input tokens). None follows the local trigger with a
         # safety margin; explicit values only clamp downward so the server goes first.
         "codex_responses_compact_threshold": None,

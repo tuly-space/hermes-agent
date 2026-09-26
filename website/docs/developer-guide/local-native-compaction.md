@@ -8,67 +8,8 @@ Live verification with `gpt-6-astra`: `/responses` plus `context_management=[{"t
 
 Local source changes require a separately authorized Gateway restart before existing processes use them. The configured production threshold is unchanged.
 
-## Optional native-first and background idle pilot
+## Native maintenance and next-turn idle compaction
 
-For a profile that has already enabled `compression.codex_responses_native: true`, set
-`compression.codex_responses_native_first: true` to attempt native `/responses`
-maintenance before automatic local summary compression. Set
-`compression.codex_responses_native_idle_after_seconds: 1500` for a one-shot
-background check 25 minutes after each completed durable turn. The profile-owned
-idle timetable is an atomic data file: this update backfills currently bound,
-completed idle sessions once; later restarts load the file, preserve original
-deadlines, and never rescan history. A single condition-driven scheduler wakes at
-the next deadline or on a timetable/worker/shutdown event and runs at most two
-compression workers, without per-session gateway timers or a polling backlog.
-Non-gateway sessions retain their existing local timer. Both new
-settings default to off; keep the older `idle_compact_after_seconds: 0` or that separate
-next-turn summary mechanism may also run. Idle maintenance requires ≥80K
-effective full-request input tokens (configurable with
-`compression.codex_responses_native_idle_min_tokens`) and ≥16K growth since
-its previous checkpoint/attempt. This floor does not guarantee savings.
-The attempt watermark is durable and the checkpoint is attached to the existing
-assistant row, never replacing searchable raw transcript rows or changing session ID.
-No completed compaction item means failure. Idle never sends its model output as
-chat. A due check for a parent session with a running/finalizing delegation or an
-undelivered (pending) completion is retired without a provider request, start
-notice, or cached-agent eviction. This read-only gate consults that profile's
-durable `state.db` ledger by the parent session ID, not the reusable gateway
-routing key or process-local registry; a ledger read error also skips the pass.
-Delivered or terminally dropped completions no longer block it. There is no
-retry/polling for a skipped deadline: processing a completion as a normal parent
-turn re-arms a full 25-minute delay after that turn, independently of when the
-completion delivery is acknowledged. New gateway turns invalidate the saved
-deadline and abort an in-flight idle request; the network wait holds no
-session-turn lease. A short atomic commit checks that no foreground turn owns
-the lease and the message watermark is unchanged.
+`compression.idle_compact_after_seconds` uses the existing turn-start gap trigger; it does not schedule background work. The existing idle size, cooldown, and lock guards determine whether a pass runs. Hermes emits its existing idle compression status when a pass is admitted; the gateway delivers this idle-resume status without enabling other routine compression progress (`compression.progress_notices` remains their gate).
 
-For a Discord session originating in a thread, an eligible background pass
-sends one small, gray `-# ⏳ 正在压缩上下文…` status to the originating thread
-when native `/responses` maintenance begins (or when ordinary summary fallback
-actually starts if the native request could not begin). On durable native or
-ordinary summary commit, it edits that **same message** to
-`-# ✓ 上下文已压缩，下次对话将接续压缩结果。`. If an already-started pass ends
-without a commit, it edits to `-# ⚠ 上下文压缩未完成，原始记录已保留。` or, when
-cancelled, `-# ⏸ 上下文压缩已取消。`. A later foreground turn does not undo
-an already committed checkpoint. Start and end use the owning profile's adapter,
-exact thread and non-conversational metadata. The edit waits for a slow start
-send to return its message ID without blocking compression. An absent ID or
-failed send/edit never triggers a second message and never changes compression.
-This is independent of routine `compression.progress_notices`; skipped,
-below-floor, stale or pre-start cancelled checks stay silent. A native failure
-followed by ordinary fallback does not send another start notice. No notice
-enters the session transcript or the next model context. Channel/DM sessions
-and other platforms receive no notice.
-
-Maintenance logs distinguish full-request *rough before* pressure from actual
-maintenance request `usage_input/usage_cached/usage_output`; after-checkpoint
-input remains unknown until an ordinary provider response reports it. Opaque
-ciphertext length is not token usage. Every new foreground turn invalidates its
-previous idle plan. Its completed turn updates the persistent idle time, while an
-idle worker conditionally removes
-only the version it claimed, even after a failure or below-threshold check. It
-will not retry that session until another completed conversation turn. The worker
-keeps raw history and the logical session intact and releases its own resources.
-Malformed timetable files fail closed rather than triggering a new history scan.
-A cross-process replay proves persistence, not an undocumented checkpoint
-lifetime guarantee.
+`auxiliary.compression.native: true` permits the supported Sol auxiliary route to attempt an inline `/responses` checkpoint when the existing compression flow admits a pass, including idle resume. `auxiliary.compression.preserve_reasoning: true` retains eligible encrypted reasoning on that route. A completed response without a compaction item falls back to the ordinary summary. Raw transcript rows remain intact and checkpoints are persisted on assistant rows. The auxiliary-native request uses the effective `auxiliary.compression.timeout`; this does not change the total compression ceiling or prove provider-side deadlines.

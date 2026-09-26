@@ -1753,8 +1753,6 @@ class GatewayShutdownMixin:
         logger.info("Stopping gateway%s...", " for restart" if self._restart_requested else "")
         ctx.started_at = time.monotonic()
         self._running = False
-        from gateway.native_idle import stop as stop_native_idle
-        await asyncio.to_thread(stop_native_idle, self)
         self._clear_plugin_message_injector()
         self._draining = True
         self._mark_api_runs_shutdown_requested()

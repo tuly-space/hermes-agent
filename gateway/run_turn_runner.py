@@ -1189,14 +1189,6 @@ class TurnRunner:
         render_notification(present, platform=self._ctx.source.platform,
                             user_config=self._ctx.user_config, diagnostic=diagnostic)
 
-    def _make_native_idle_start_callback(self):
-        """Capture the exact transport/thread, without retaining the turn runner."""
-        from gateway.native_idle import native_idle_start_callback
-        from hermes_constants import get_hermes_home
-        ctx = self._ctx
-        return native_idle_start_callback(ctx.source, ctx._status_adapter, ctx._loop_for_step,
-                                          get_hermes_home(), muted=ctx.mute_notification_reply)
-
     def _make_bg_review_callbacks(self):
         """(send, release): background-review messages ("💾 Memory updated") are held until the
         adapter's post-delivery hook releases them after the main response lands."""
@@ -1270,7 +1262,6 @@ class TurnRunner:
         agent.stream_delta_callback = stream_delta_cb
         agent.interim_assistant_callback = interim_assistant_cb if want_interim_messages else None
         agent.status_callback, agent.notice_callback = ctx._status_callback_sync, self._notice_callback_sync
-        agent._native_idle_start_callback = self._make_native_idle_start_callback()
         agent.notice_clear_callback = None  # sends can't be retracted
         agent.event_callback = ctx._event_callback_sync
         agent.reasoning_config, agent.service_tier = reasoning_config, runner._service_tier

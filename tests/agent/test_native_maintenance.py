@@ -1,6 +1,4 @@
-"""Native-first maintenance: raw SSE, durable CAS, one-shot idle scheduler."""
-import threading
-import time
+"""Native-first maintenance: raw SSE and durable checkpoint CAS."""
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -58,66 +56,10 @@ def _events(item=None, status="completed"):
     return result
 
 
-def _delegation(db, delegation_id, parent, state="running", delivery="pending"):
-    now = time.time()
-    db._write_sql("""INSERT INTO async_delegations
-        (delegation_id, origin_session, parent_session_id, state, dispatched_at,
-         updated_at, delivery_state) VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (delegation_id, "reusable-gateway-key", parent, state, now, now, delivery))
 
 
-def test_idle_delegation_guard_uses_durable_parent_and_profile_not_reusable_key(tmp_path):
-    a = SessionDB(db_path=tmp_path / "a" / "state.db")
-    b = SessionDB(db_path=tmp_path / "b" / "state.db")
-    try:
-        for db in (a, b):
-            db.create_session("parent", source="discord")
-        _delegation(a, "other-parent", "replaced-session")
-        _delegation(b, "other-profile", "parent")
-        assert not maintenance.idle_delegation_blocked(a, "parent")
-        for state in ("running", "finalizing", "completed"):
-            delegation_id = f"state-{state}"
-            _delegation(a, delegation_id, "parent", state)
-            # A fresh handle reads the same ledger, not process-local delegation records.
-            restarted = SessionDB(db_path=a.db_path)
-            try:
-                assert maintenance.idle_delegation_blocked(restarted, "parent")
-            finally:
-                restarted.close()
-            a._write_sql("UPDATE async_delegations SET delivery_state='delivered' WHERE delegation_id=?",
-                         (delegation_id,))
-            assert maintenance.idle_delegation_blocked(a, "parent") is (state != "completed")
-            a._write_sql("DELETE FROM async_delegations WHERE delegation_id=?", (delegation_id,))
-        _delegation(a, "done", "parent", "completed", "dropped")
-        assert not maintenance.idle_delegation_blocked(a, "parent")
-        assert maintenance.idle_delegation_blocked(b, "parent")
-    finally:
-        a.close()
-        b.close()
 
 
-def test_local_idle_tick_skips_pending_delivery_and_failed_ledger_without_provider(monkeypatch, session):
-    agent, _ = _agent(session, [])
-    agent._native_idle_cancel = threading.Event()
-    agent._native_idle_handle = object()
-    agent.compression_native_idle_after_seconds = 1500
-    provider = Mock()
-    monkeypatch.setattr(maintenance, "attempt", provider)
-    notice = Mock()
-    agent._native_idle_start_callback = notice
-    _delegation(session, "pending-completion", agent.session_id, "completed")
-    assert maintenance._idle_tick(agent, agent.session_id) is False
-    session._write_sql("UPDATE async_delegations SET delivery_state='delivered' WHERE delegation_id='pending-completion'")
-    original = session._read_one
-    def unavailable(sql, params=()):
-        if "FROM async_delegations" in sql:
-            raise OSError("ledger unavailable")
-        return original(sql, params)
-    monkeypatch.setattr(session, "_read_one", unavailable)
-    assert maintenance._idle_tick(agent, agent.session_id) is False
-    provider.assert_not_called()
-    notice.assert_not_called()
-    assert session.get_session_model_config_value(agent.session_id, maintenance._IDLE_KEY, None) is None
 
 
 def _run(monkeypatch, agent, db):
@@ -212,114 +154,12 @@ def test_real_builder_replays_big_tool_checkpoint_at_covered_boundary(monkeypatc
         agent.close()
 
 
-def test_failed_native_idle_uses_real_in_place_compressor(monkeypatch, session):
-    from run_agent import AIAgent
-
-    agent = AIAgent(api_key="test-key", base_url="https://api.openai.com/v1",
-                    api_mode="codex_responses", model="gpt-5.6", provider="openai-api",
-                    session_db=session, session_id="same-session", quiet_mode=True,
-                    skip_context_files=True, skip_memory=True, enabled_toolsets=[])
-    agent.compression_native_first = agent.codex_responses_native_compaction = True
-    agent.compression_in_place = True
-    agent._cached_system_prompt = "Frozen instruction bytes"
-    agent._session_messages = session.get_messages_as_conversation("same-session", include_row_ids=True)
-    generation = threading.Event()
-    agent._native_idle_cancel = generation
-    agent._native_idle_handle = Mock()
-    agent.compression_native_idle_after_seconds = 1500
-    agent.compression_native_idle_min_tokens = 80_000
-    client = SimpleNamespace(responses=SimpleNamespace(create=Mock(return_value=iter(_events()))))
-    monkeypatch.setattr(agent, "_create_request_openai_client", lambda **kw: client)
-    monkeypatch.setattr(agent, "_close_request_openai_client", lambda *a, **kw: None)
-    monkeypatch.setattr(maintenance, "_idle_pressure", lambda *a: 80_000)
-    agent.context_compressor.compress = lambda *a, **kw: [
-        {"role": "user", "content": "Summary of old fact"},
-        {"role": "assistant", "content": "Acknowledged summary"},
-    ]
-    try:
-        maintenance._idle_tick(agent, agent.session_id, generation)
-        assert agent.session_id == "same-session"
-        assert [m["content"] for m in session.get_messages_as_conversation("same-session")] == [
-            "Summary of old fact", "Acknowledged summary"]
-        assert [m["content"] for m in agent._session_messages] == [
-            "Summary of old fact", "Acknowledged summary"]
-        assert len(session.get_messages("same-session", include_inactive=True)) > len(agent._session_messages)
-    finally:
-        agent.close()
 
 
-def test_post_checkpoint_real_usage_rebaselines_idle_growth(session):
-    from run_agent import AIAgent
-    from agent.turn_usage import record_response_usage
-
-    agent = AIAgent(api_key="test-key", base_url="https://api.openai.com/v1",
-                    api_mode="codex_responses", model="gpt-5.6", provider="openai-api",
-                    session_db=session, session_id="same-session", quiet_mode=True,
-                    skip_context_files=True, skip_memory=True, enabled_toolsets=[])
-    session.patch_session_model_config("same-session", {
-        maintenance._IDLE_KEY: {"model": agent.model, "pressure": 175_000}})
-    agent._native_maintenance_pending_followup = "idle"
-    try:
-        messages = session.get_messages_as_conversation("same-session")
-        response = SimpleNamespace(usage={"input_tokens": 95_000, "output_tokens": 100,
-                                          "input_tokens_details": {"cached_tokens": 30_000}})
-        record_response_usage(agent, response, messages=messages, api_call_count=1,
-                              api_duration=0.1, compression_attempts=0, max_compression_attempts=3)
-        baseline = session.get_session_model_config_value("same-session", maintenance._IDLE_KEY)
-        assert baseline == {"model": agent.model, "pressure": 95_000}
-        assert agent._native_maintenance_pending_followup is None
-    finally:
-        agent.close()
 
 
-def test_rearmed_idle_revision_supersedes_old_one(monkeypatch, session):
-    from agent.idle_timetable import IdleTimetable
-    table = IdleTimetable(session.db_path.parent / "idle.json")
-    monkeypatch.setattr("agent.idle_timetable.for_home", lambda *_: table)
-    agent, _ = _agent(session, [])
-    agent._gateway_session_key = "session-key"
-    agent.compression_native_idle_after_seconds = 1500
-    maintenance.arm_idle(agent, {"completed": True})
-    old = table._entries[agent.session_id]["revision"]
-    maintenance.arm_idle(agent, {"completed": True})
-    new = table._entries[agent.session_id]["revision"]
-    assert old != new
-    assert not table.remove(agent.session_id, old)
-    assert table._entries[agent.session_id]["revision"] == new
 
 
-@pytest.mark.parametrize("cancel,append", [(True, False), (False, True)])
-def test_idle_cancellation_or_stale_append_never_summarizes(monkeypatch, session, cancel, append):
-    agent, client = _agent(session, [])
-    agent._native_idle_cancel = threading.Event()
-    agent._native_idle_handle = Mock()
-    agent.compression_native_idle_after_seconds = 1500
-    monkeypatch.setattr(maintenance, "_idle_pressure", lambda *a: 80_000)
-    class Stream:
-        def __iter__(self):
-            if cancel:
-                agent._native_idle_cancel.set()
-            if append:
-                session.append_message("same-session", "user", "arrived during maintenance")
-            return iter(_events())
-        def close(self):
-            pass
-    client.responses.create.return_value = Stream()
-    from agent import chat_completion_helpers, turn_request_assembly
-    monkeypatch.setattr(turn_request_assembly, "maintenance_api_prefix",
-                        lambda a, rows, prompt: [{"role": "system", "content": prompt}] + [
-                            {"role": m["role"], "content": m.get("content", "")} for m in rows])
-    monkeypatch.setattr(chat_completion_helpers, "build_api_kwargs", lambda a, messages: {
-        "model": a.model, "instructions": messages[0]["content"],
-        "input": [{"role": m["role"], "content": m.get("content", "")}
-                  for m in messages[1:] if m.get("role") != "tool"],
-        "context_management": [{"type": "compaction", "compact_threshold": 90_000}],
-        "store": False})
-    summarized = Mock()
-    agent._compress_context = summarized
-    maintenance._idle_tick(agent, agent.session_id, agent._native_idle_cancel)
-    summarized.assert_not_called()
-    assert session.get_messages_as_conversation("same-session")[0]["content"] == "An old fact"
 
 
 @pytest.mark.parametrize("stream", [_events(), _events({"type": "compaction", "encrypted_content": ""}),
@@ -348,49 +188,8 @@ def test_stale_watermark_or_active_turn_rejects_checkpoint(session):
         session.release_session_turn_lease("same-session", owner)
 
 
-def test_idle_persisted_after_turn_and_cancelled(monkeypatch, session):
-    from agent.idle_timetable import IdleTimetable
-    table = IdleTimetable(session.db_path.parent / "idle.json")
-    monkeypatch.setattr("agent.idle_timetable.for_home", lambda *_: table)
-    agent, _ = _agent(session, [])
-    agent._gateway_session_key = "session-key"
-    agent.compression_native_idle_after_seconds = 1500
-    maintenance.arm_idle(agent, {"completed": True})
-    item = table._entries[agent.session_id]
-    assert item["delay"] == 1500
-    assert IdleTimetable(table.path)._read()["entries"][agent.session_id] == item
-    maintenance.cancel_idle(agent)
-    assert agent.session_id not in table._entries
 
 
-def test_idle_floor_growth_and_opt_in(monkeypatch, session):
-    agent, _ = _agent(session, [])
-    agent._native_idle_handle = object()
-    agent.compression_native_idle_after_seconds = 1500
-    agent._native_idle_cancel = threading.Event()
-    monkeypatch.setattr(maintenance, "_idle_pressure", lambda *_: 79_999)
-    called = Mock()
-    monkeypatch.setattr(maintenance, "attempt", called)
-    assert maintenance._idle_tick(agent, agent.session_id) is False
-    called.assert_not_called()
-    monkeypatch.setattr(maintenance, "_idle_pressure", lambda *_: 80_000)
-    assert maintenance._idle_tick(agent, agent.session_id) is True
-    called.assert_called_once()
-    assert maintenance._idle_tick(agent, agent.session_id) is False
-    called.assert_called_once()  # durable no-growth guard, even after a failed attempt
-    reopened = SessionDB(db_path=session.db_path)
-    try:
-        successor, _ = _agent(reopened, [])
-        successor.compression_native_idle_after_seconds = 1500
-        successor._native_idle_handle = object()
-        successor._native_idle_cancel = threading.Event()
-        assert maintenance._idle_tick(successor, successor.session_id) is False
-        called.assert_called_once()  # new agent reads the same persisted pressure
-    finally:
-        reopened.close()
-    agent.compression_native_first = False
-    assert maintenance._idle_tick(agent, agent.session_id) is False
-    called.assert_called_once()
 
 
 def test_delayed_provider_output_cannot_commit_after_new_message(monkeypatch, session):
@@ -407,48 +206,6 @@ def test_delayed_provider_output_cannot_commit_after_new_message(monkeypatch, se
     assert not has_replayable_native_compaction_checkpoint(agent, session.get_messages_as_conversation("same-session"))
 
 
-def test_real_agent_config_and_request_builder_are_profile_scoped(tmp_path, monkeypatch):
-    from run_agent import AIAgent
-    from agent.chat_completion_helpers import build_api_kwargs
-
-    def construct(home, enabled):
-        home.mkdir()
-        if enabled:
-            (home / "config.yaml").write_text(
-                "compression:\n  codex_responses_native: true\n"
-                "  codex_responses_native_first: true\n"
-                "  codex_responses_native_idle_after_seconds: 1500\n")
-        monkeypatch.setenv("HERMES_HOME", str(home))
-        return AIAgent(api_key="test-key", base_url="https://api.openai.com/v1",
-                       api_mode="codex_responses", model="gpt-5.6", provider="openai-api",
-                       quiet_mode=True, skip_context_files=True, skip_memory=True,
-                       enabled_toolsets=[])
-
-    a = construct(tmp_path / "profile-a", True)
-    b = construct(tmp_path / "profile-b", False)
-    assert maintenance.eligible(a)
-    assert a.compression_native_idle_after_seconds == 1500
-    assert a.compression_native_idle_min_tokens == 80_000
-    assert not maintenance.eligible(b)
-    a2 = construct(tmp_path / "profile-a-new", True)
-    assert maintenance.eligible(a2)
-    kwargs = build_api_kwargs(a2, [
-        {"role": "system", "content": "frozen"},
-        {"role": "user", "content": "hello"},
-        {"role": "assistant", "content": "ack"},
-    ])
-    assert kwargs["instructions"] == "frozen"
-    assert kwargs["context_management"]
-    from tui_gateway.session_compression import _apply_live_compression_config
-    _apply_live_compression_config(a2, {"compression": {
-        "codex_responses_native": True, "codex_responses_native_first": True,
-        "codex_responses_native_idle_after_seconds": 300,
-        "codex_responses_native_idle_min_tokens": 120_000}})
-    assert a2.compression_native_idle_min_tokens == 120_000
-    _apply_live_compression_config(a2, {"compression": {}})
-    assert a2.compression_native_idle_min_tokens == 80_000
-    for agent in (a, b, a2):
-        agent.close()
 
 
 def test_truncated_stream_with_compaction_item_is_not_committed(monkeypatch, session):
@@ -537,94 +294,10 @@ def test_maintenance_uses_send_transforms_for_digest_and_tool_boundary(session, 
         agent.close()
 
 
-@pytest.mark.parametrize("active_turn", [True, False])
-def test_idle_inflight_does_not_lease_turn_or_commit_over_active_turn(monkeypatch, session, active_turn):
-    agent, client = _agent(session, [])
-    agent._native_idle_cancel = threading.Event()
-    agent._native_idle_handle = Mock()
-    agent.compression_native_idle_after_seconds = 1500
-    monkeypatch.setattr(maintenance, "_idle_pressure", lambda *a: 80_000)
-    from agent import turn_request_assembly, chat_completion_helpers
-    monkeypatch.setattr(turn_request_assembly, "maintenance_api_prefix",
-                        lambda a, rows, prompt: [{"role": "system", "content": prompt}] + [
-                            {"role": m["role"], "content": m.get("content", "")} for m in rows])
-    monkeypatch.setattr(chat_completion_helpers, "build_api_kwargs", lambda a, rows: {
-        "model": a.model, "instructions": rows[0]["content"], "input": rows[1:],
-        "context_management": [{"type": "compaction", "compact_threshold": 90_000}], "store": False})
-    foreground = SessionDB(db_path=session.db_path)
-    owner = "pid=1:foreground"
-    class Stream:
-        def __iter__(self):
-            # A different process/connection can admit a foreground turn while
-            # the native HTTP stream is in flight (no 360-second idle lease).
-            assert foreground.try_acquire_session_turn_lease("same-session", owner, patience_s=0.5)
-            if not active_turn:
-                foreground.release_session_turn_lease("same-session", owner)
-                foreground.append_message("same-session", "user", "new turn")
-            return iter(_events({"type": "compaction", "encrypted_content": "late"}))
-        def close(self):
-            pass
-    client.responses.create.return_value = Stream()
-    agent._compress_context = Mock()
-    try:
-        maintenance._idle_tick(agent, agent.session_id, agent._native_idle_cancel)
-        assert not has_replayable_native_compaction_checkpoint(
-            agent, session.get_messages_as_conversation("same-session"))
-        agent._compress_context.assert_not_called()
-    finally:
-        foreground.release_session_turn_lease("same-session", owner)
-        foreground.close()
 
 
-def test_idle_summary_commit_rejects_foreground_lease(session):
-    from hermes_state_errors import SessionTurnLeaseLostError
-    watermark = session.get_active_message_watermark("same-session")
-    owner = "pid=1:foreground"
-    assert session.try_acquire_session_turn_lease("same-session", owner)
-    try:
-        with pytest.raises(SessionTurnLeaseLostError):
-            session.archive_and_compact("same-session", [{"role": "assistant", "content": "stale summary"}],
-                                        watermark=watermark, exact_watermark=watermark)
-        assert session.get_messages_as_conversation("same-session")[-1]["content"] == "Acknowledged"
-    finally:
-        session.release_session_turn_lease("same-session", owner)
 
 
-def test_cross_process_turn_admission_during_idle_stream(monkeypatch, session):
-    import subprocess
-    import sys
-    agent, client = _agent(session, [])
-    agent._native_idle_cancel = threading.Event()
-    agent._native_idle_handle = Mock()
-    agent.compression_native_idle_after_seconds = 1500
-    monkeypatch.setattr(maintenance, "_idle_pressure", lambda *a: 80_000)
-    from agent import turn_request_assembly, chat_completion_helpers
-    monkeypatch.setattr(turn_request_assembly, "maintenance_api_prefix",
-                        lambda a, rows, prompt: [{"role": "system", "content": prompt}] + [
-                            {"role": m["role"], "content": m.get("content", "")} for m in rows])
-    monkeypatch.setattr(chat_completion_helpers, "build_api_kwargs", lambda a, rows: {
-        "model": a.model, "instructions": rows[0]["content"], "input": rows[1:],
-        "context_management": [{"type": "compaction", "compact_threshold": 90_000}], "store": False})
-    class Stream:
-        def __iter__(self):
-            child = subprocess.run([sys.executable, "-c",
-                "from hermes_state import SessionDB; from pathlib import Path; import sys; db=SessionDB(db_path=Path(sys.argv[1])); "
-                "ok=db.try_acquire_session_turn_lease('same-session', 'child-foreground', patience_s=0.5); "
-                "print(ok); db.append_message('same-session', 'user', 'cross-process input'); "
-                "db.release_session_turn_lease('same-session', 'child-foreground'); db.close()",
-                str(session.db_path)], capture_output=True, text=True, timeout=8)
-            assert child.returncode == 0, child.stderr
-            assert child.stdout.strip() == "True"
-            return iter(_events({"type": "compaction", "encrypted_content": "stale"}))
-        def close(self):
-            pass
-    client.responses.create.return_value = Stream()
-    agent._compress_context = Mock()
-    maintenance._idle_tick(agent, agent.session_id, agent._native_idle_cancel)
-    agent._compress_context.assert_not_called()
-    assert session.get_messages_as_conversation("same-session")[-1]["content"] == "cross-process input"
-    assert not has_replayable_native_compaction_checkpoint(
-        agent, session.get_messages_as_conversation("same-session"))
 
 
 @pytest.mark.parametrize("native_success", [True, False])

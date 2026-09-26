@@ -152,7 +152,13 @@ def _idle_compaction(
     _idle_after = getattr(agent, "compression_idle_compact_after_seconds", 0)
     if not (agent.compression_enabled and _idle_after > 0 and messages):
         return
-    _idle_gap = time.time() - getattr(agent, "_last_activity_ts", time.time())
+    # A restored agent is constructed now, and the turn lease touches its activity
+    # clock before this pass. Prefer the previous transcript's existing timestamp.
+    prior = out.messages[:out.current_turn_user_idx]
+    prior_times = [float(m["timestamp"]) for m in prior if isinstance(m.get("timestamp"), (int, float))]
+    last_activity = max(prior_times) if prior_times else getattr(
+        agent, "_idle_previous_activity_ts", getattr(agent, "_last_activity_ts", time.time()))
+    _idle_gap = time.time() - last_activity
     if _idle_gap < _idle_after:
         return
     _compressor = agent.context_compressor
@@ -160,9 +166,6 @@ def _idle_compaction(
     # rather than an opaque ciphertext estimate, decides whether local compression is
     # still needed.  Threshold and post-tool preflight honor the same latch.
     if bool(getattr(_compressor, "awaiting_real_usage_after_compression", False)):
-        return
-    from agent.native_maintenance import before_summary
-    if before_summary(agent, messages):
         return
     # Route-aware pressure: on compacted native-Codex sessions the durable figure
     # overstates the wire, so reuse the preflight estimator.

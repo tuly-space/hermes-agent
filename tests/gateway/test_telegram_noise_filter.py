@@ -4,6 +4,7 @@ import pytest
 
 from agent.conversation_compression import (
     CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE,
+    IDLE_COMPACTION_STATUS_TEMPLATE,
     ROUTINE_COMPRESSION_STATUS_SAMPLES,
 )
 from gateway.config import Platform
@@ -31,7 +32,6 @@ NOISY_STATUS_MESSAGES = [
         "Compacting before the next model call."
     ),
     "🗜️ Compacting context — summarizing earlier conversation so I can continue...",
-    "💤 Resumed after 3600s idle — compacting ~120,000 tokens before continuing.",
     "⚠️  Session compressed 12 times — accuracy may degrade. Consider /new to start fresh.",
     "⚠ Compression summary failed: upstream error. Inserted a fallback context marker.",
     "⏱️ Rate limited. Waiting 30.0s (attempt 2/3)...",
@@ -64,6 +64,7 @@ NOISY_STATUS_MESSAGES = [
 # feedback (manual_compression_feedback.py headlines) and abort/failure
 # notices that require user action.
 VISIBLE_COMPRESSION_MESSAGES = [
+    IDLE_COMPACTION_STATUS_TEMPLATE.format(idle_seconds=3600, tokens=120000),
     "Compressed: 30 → 12 messages",
     "Compression aborted: 30 messages preserved",
     "Compressed with fallback: 30 → 12 messages",
@@ -154,15 +155,15 @@ def test_all_chat_gateways_suppress_noise(platform, message):
 def test_all_routine_compression_statuses_suppressed_from_source_constants(
     platform, message
 ):
-    """Every ROUTINE compression status the agent actually emits is filtered.
+    """Routine progress is filtered except the existing idle-resume status.
 
     Iterates the sample-formatted status strings built from the SAME
-    constants the emission sites use (agent/conversation_compression.py's
-    ROUTINE_COMPRESSION_STATUS_SAMPLES), so a reworded emit site that drifts
-    past the noise regex fails here without anyone remembering to re-copy
-    the literal into this file.
+    constants the emission sites use. The idle status is the one exception
+    delivered on a resumed turn without enabling general progress notices.
     """
-    assert _prepare_gateway_status_message(platform, "lifecycle", message) is None
+    visible_idle = IDLE_COMPACTION_STATUS_TEMPLATE.format(idle_seconds=3600, tokens=120000)
+    expected = message if message == visible_idle else None
+    assert _prepare_gateway_status_message(platform, "lifecycle", message) == expected
 
 
 @pytest.mark.parametrize("platform", CHAT_PLATFORMS)

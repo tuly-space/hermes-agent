@@ -113,14 +113,6 @@ def _apply_live_compression_config(agent: Any, cfg: dict | None) -> None:
     agent.compression_aux_provider = aux_compression.get("provider")
     agent.compression_aux_model = aux_compression.get("model")
     agent.compression_aux_base_url = aux_compression.get("base_url")
-    with contextlib.suppress(TypeError, ValueError):
-        agent.compression_native_idle_after_seconds = max(
-            0, int(compression.get("codex_responses_native_idle_after_seconds", 0) or 0))
-    try:
-        agent.compression_native_idle_min_tokens = max(
-            1, int(compression.get("codex_responses_native_idle_min_tokens", 80_000)))
-    except (TypeError, ValueError):
-        agent.compression_native_idle_min_tokens = 80_000
     native_threshold_raw = compression.get("codex_responses_compact_threshold", 200_000)
     try:
         if isinstance(native_threshold_raw, bool) or (native_threshold := int(native_threshold_raw)) <= 0:

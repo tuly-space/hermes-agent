@@ -1499,8 +1499,6 @@ def _parse_compression_config(agent, _agent_cfg) -> CompressionSettings:
     # seconds idle (0 = disabled). Consumed by build_turn_context().
     idle_compact_after_seconds = max(0, int(cfg.get("idle_compact_after_seconds", 0)))
     native_first = is_truthy_value(cfg.get("codex_responses_native_first", False))
-    native_idle_after = max(0, _parse_config_int(cfg.get("codex_responses_native_idle_after_seconds", 0), 0))
-    native_idle_min = max(1, _parse_config_int(cfg.get("codex_responses_native_idle_min_tokens", 80_000), 80_000))
     return CompressionSettings(
         threshold=threshold,
         autoraise_notice_enabled=autoraise_notice_enabled,
@@ -1549,8 +1547,6 @@ def _parse_compression_config(agent, _agent_cfg) -> CompressionSettings:
         codex_responses_compact_threshold=compact_threshold,
         idle_compact_after_seconds=idle_compact_after_seconds,
         codex_responses_native_first=native_first,
-        codex_responses_native_idle_after_seconds=native_idle_after,
-        codex_responses_native_idle_min_tokens=native_idle_min,
     )
 
 
@@ -2013,8 +2009,6 @@ def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_c
     agent.compression_aux_provider = auxiliary_compression.get("provider")
     agent.compression_aux_model = auxiliary_compression.get("model")
     agent.compression_aux_base_url = auxiliary_compression.get("base_url")
-    agent.compression_native_idle_after_seconds = cs.codex_responses_native_idle_after_seconds
-    agent.compression_native_idle_min_tokens = cs.codex_responses_native_idle_min_tokens
 
 
 def _enforce_minimum_context(agent):

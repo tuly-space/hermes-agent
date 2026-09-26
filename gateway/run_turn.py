@@ -2042,16 +2042,6 @@ class GatewayTurnMixin:
         ``(_PreparedTurn, env_tokens)``; a ``str`` first element is a reply to send instead of
         running (history unreadable); ``None`` drops the turn (inbound text rejected)."""
         from gateway.run import _load_gateway_config
-        # Foreground admission wins before it can wait on an idle provider request.
-        from agent.idle_timetable import for_home
-        from gateway.native_idle import enabled as native_idle_enabled
-        from hermes_constants import get_hermes_home
-        with self._profile_scope_for_source(source):
-            try:
-                if native_idle_enabled():
-                    await asyncio.to_thread(for_home(get_hermes_home()).cancel, session_entry.session_id)
-            except Exception:
-                logger.warning("Could not cancel old idle timetable before foreground turn", exc_info=True)
         _was_auto_reset, _is_new_session = await self._hmwa_open_session(session_entry, session_key, source)
         context = build_session_context(source, self.config, session_entry)
         # Session context variables for tools (task-local, concurrency-safe)

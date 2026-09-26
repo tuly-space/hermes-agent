@@ -276,11 +276,14 @@ class CompressionFacadeMixin:
                 fence_stack.append(registration)
                 self._active_compression_commit_fence = active_fence
 
-            if not force and not focus_topic and not getattr(self, "_native_idle_summary_fallback", False):
+            if not force and not focus_topic:
                 from agent.native_maintenance import attempt, before_summary
                 if before_summary(self, messages):
                     threshold = getattr(getattr(self, "context_compressor", None), "threshold_tokens", 0)
-                    if isinstance(approx_tokens, int) and approx_tokens >= threshold > 0:
+                    # Auxiliary native is a backend choice after the caller has
+                    # admitted compression (including idle below the size threshold).
+                    if getattr(self, "compression_aux_native", None) is True or (
+                            isinstance(approx_tokens, int) and approx_tokens >= threshold > 0):
                         db, sid = getattr(self, "_session_db", None), getattr(self, "session_id", None)
                         try:
                             # Post-tool/pre-API calls flush their tail before checkpointing.

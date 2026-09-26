@@ -37,8 +37,6 @@ class TurnFacadeMixin:
         from agent.background_review import cancel_background_review_for_live_turn
 
         cancel_background_review_for_live_turn(self)
-        from agent.native_maintenance import cancel_idle
-        cancel_idle(self)
 
         from agent import relay_runtime
         from agent.aux_accounting import reset_accounting_context, set_accounting_context
@@ -135,6 +133,7 @@ class TurnFacadeMixin:
             with bind_subagent_parent(self), scoped_runtime_main({}), track_in_interrupt_scope(self):
                 try:
                     if lease is not None:
+                        self._idle_previous_activity_ts = getattr(self, "_last_activity_ts", None)
                         lease.start()
                     result = run_conversation(
                         self, user_message, system_message, conversation_history, effective_task_id,
@@ -202,12 +201,6 @@ class TurnFacadeMixin:
                         reset_conversation_context(token)
                     if affinity_token is not None:
                         reset_affinity_scope(affinity_token)
-                    # Arming occurs after the turn lease is released. The scheduler
-                    # captures the turn's profile context for its deferred callback.
-                    if relay_outcome == "success":
-                        with suppress(Exception):
-                            from agent.native_maintenance import arm_idle
-                            arm_idle(self, locals().get("result"))
                     # Balance note_turn_started so the idle queue's live-turn count cannot leak.
                     with suppress(Exception):
                         _review_queue.note_turn_finished()

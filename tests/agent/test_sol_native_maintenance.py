@@ -201,3 +201,24 @@ def test_native_response_without_checkpoint_uses_ordinary_summary(tmp_path, monk
         summaries.assert_called_once()
     finally:
         agent.close()
+
+
+@pytest.mark.parametrize("timeout", [600, 420])
+def test_sol_maintenance_inherits_compression_timeout(tmp_path, monkeypatch, timeout):
+    home = tmp_path / "profile"
+    agent = _agent(home, monkeypatch)
+    (home / "config.yaml").write_text(
+        "auxiliary:\n  compression:\n    provider: openai-codex\n"
+        f"    model: gpt-6-sol\n    native: true\n    timeout: {timeout}\n"
+    )
+    calls = []
+    client = SimpleNamespace(responses=SimpleNamespace(create=lambda **kw: calls.append(kw) or _events()))
+    monkeypatch.setattr(agent, "_create_request_openai_client", lambda **kw: client)
+    monkeypatch.setattr(agent, "_close_request_openai_client", lambda *a, **kw: None)
+    try:
+        assert native_maintenance.attempt(agent, [
+            {"role": "user", "content": "fact"}, {"role": "assistant", "content": "ack"},
+        ], "Frozen", 100_000, phase="threshold")
+        assert calls[0]["timeout"] == timeout
+    finally:
+        agent.close()

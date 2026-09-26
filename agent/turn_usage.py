@@ -109,15 +109,6 @@ def record_response_usage(
     maintenance_phase = getattr(agent, "_native_maintenance_pending_followup", None)
     if maintenance_phase:
         agent._native_maintenance_pending_followup = None
-        if isinstance(aggregator_usage.prompt_tokens, int) and aggregator_usage.prompt_tokens > 0:
-            from agent.native_maintenance import _IDLE_KEY
-            db, sid = getattr(agent, "_session_db", None), getattr(agent, "session_id", None)
-            if db is not None and sid:
-                try:
-                    db.patch_session_model_config(sid, {_IDLE_KEY: {
-                        "model": agent.model, "pressure": aggregator_usage.prompt_tokens}})
-                except Exception:
-                    logger.warning("Native maintenance growth baseline persist failed", exc_info=True)
         logger.info(
             "Native maintenance follow-up phase=%s actual_full_input=%s "
             "actual_cached=%s actual_output=%s session=%s",
