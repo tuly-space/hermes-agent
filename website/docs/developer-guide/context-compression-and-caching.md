@@ -140,6 +140,8 @@ never-estimate acceptance. The following policies remain unchanged:
   whole prefix, model, tools, or system prompt.
 - Opt-in idle compaction uses its own floor/cooldown and can act on unanchored
   pressure; it does not share the threshold gate's one-request wait.
+  Idle time is measured from the last prior message (including assistant replies
+  and tool results), not the session's creation time or the newly received input.
 - Pre-agent gateway hygiene retains its rough-history fallback and hard-message
   safety valve. The replay harness's `gateway` shape reloads transcript dictionaries;
   it does **not** exercise that separate hygiene policy.

@@ -155,8 +155,8 @@ def _idle_compaction(
     # A restored agent is constructed now, and the turn lease touches its activity
     # clock before this pass. Prefer the previous transcript's existing timestamp.
     prior = out.messages[:out.current_turn_user_idx]
-    prior_times = [float(m["timestamp"]) for m in prior if isinstance(m.get("timestamp"), (int, float))]
-    last_activity = max(prior_times) if prior_times else getattr(
+    last_timestamp = prior[-1].get("timestamp") if prior else None
+    last_activity = float(last_timestamp) if isinstance(last_timestamp, (int, float)) else getattr(
         agent, "_idle_previous_activity_ts", getattr(agent, "_last_activity_ts", time.time()))
     _idle_gap = time.time() - last_activity
     if _idle_gap < _idle_after:

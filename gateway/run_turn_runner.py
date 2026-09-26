@@ -1629,7 +1629,7 @@ class TurnRunner:
         # Auto-continue: history ending with a tool result means the previous turn was cut off
         # (restart, crash, SIGTERM). Session-level resume_pending (drain-timeout shutdown) uses
         # stronger reason-aware wording that subsumes this case. Both gate on the age of
-        # ``history[-1]`` (not agent_history, which stripped tool-row timestamps); no stamp = fresh.
+        # ``history[-1]`` (the original transcript before replay cleanup); no stamp = fresh.
         window = _auto_continue_freshness_window()
         interruption_is_fresh = _is_fresh_gateway_interruption(_last_transcript_timestamp(ctx.history), window_secs=window)
         entry = None

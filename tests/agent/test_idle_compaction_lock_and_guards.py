@@ -25,6 +25,8 @@ import types
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from hermes_state import SessionDB
 
 from agent.turn_context import build_turn_context
@@ -174,6 +176,48 @@ def _pin_compress_seam(agent):
     seam = MagicMock(side_effect=lambda messages, *a, **k: (messages, "SYSTEM"))
     agent._compress_context = seam
     return seam
+
+
+@pytest.mark.parametrize("last_role", ["assistant", "tool"])
+@pytest.mark.parametrize("gap", [60, 7200])
+def test_gateway_idle_uses_last_message_after_cron_seed(tmp_path, last_role, gap):
+    """Cron seed/user merging must not hide the latest reply or tool activity."""
+    from agent.turn_context_compaction import CompactionOutcome, _idle_compaction
+    from gateway.run import _build_gateway_agent_history
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    sid = "IDLE_CRON_REPLY"
+    db.create_session(sid, source="discord")
+    now = time.time()
+    db.append_message(sid, role="user", content="cron brief", timestamp=now - 10000)
+    db.append_message(sid, role="user", content="handle it", timestamp=now - gap - 10)
+    if last_role == "tool":
+        db.append_message(sid, role="assistant", content="", timestamp=now - gap - 1,
+                          tool_calls=[{"id": "call_1", "type": "function",
+                                       "function": {"name": "terminal", "arguments": "{}"}}])
+        db.append_message(sid, role="tool", content="done", tool_call_id="call_1",
+                          timestamp=now - gap)
+    else:
+        db.append_message(sid, role="assistant", content="done", timestamp=now - gap)
+    try:
+        history, _ = _build_gateway_agent_history(
+            db.get_messages_as_conversation(sid, repair_alternation=True))
+        agent = _prep_idle_agent(db, sid, idle_after=3600, idle_gap=10000)
+        seam = _pin_compress_seam(agent)
+        outcome = CompactionOutcome(
+            messages=history + [{"role": "user", "content": "next", "timestamp": now}],
+            active_system_prompt="SYSTEM", conversation_history=history,
+            current_turn_user_idx=len(history),
+        )
+        with patch("agent.turn_context_compaction.time.time", return_value=now), \
+             patch("agent.turn_context._preflight_request_tokens", return_value=60000):
+            _idle_compaction(agent, outcome, "SYSTEM", "next", sid)
+        if gap < 3600:
+            seam.assert_not_called()
+        else:
+            seam.assert_called_once()
+    finally:
+        db.close()
 
 
 def test_idle_compaction_skips_a_transcript_that_has_not_grown(tmp_path: Path) -> None:
