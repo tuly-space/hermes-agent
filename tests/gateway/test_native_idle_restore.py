@@ -12,7 +12,7 @@ import pytest
 from agent.idle_timetable import IdleTimetable
 from agent.native_maintenance import idle_delegation_blocked
 from agent.usage_anchor import capture_usage_anchor
-from gateway.config import GatewayConfig, Platform
+from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.session import SessionSource, SessionStore
 from gateway import native_idle
 from gateway.run_agent_cache import GatewayAgentCacheMixin
@@ -22,7 +22,7 @@ from run_agent import AIAgent
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("case", ["success", "fallback_success", "persist_failure", "fresh_activity",
-                                  "tick_false", "tick_raise", "completion_send_failure",
+                                  "tick_false", "tick_raise", "tick_cancel", "start_send_failure", "completion_edit_failure",
                                   "completion_schedule_failure", "postcommit_cancel",
                                   "delegation_running", "delegation_finalizing", "completion_pending",
                                   "completion_delivered", "completion_dropped", "other_parent",
@@ -59,16 +59,43 @@ async def test_restored_missing_prompt_reaches_fake_provider_and_retires(tmp_pat
     (project / "AGENTS.md").write_text("Saved workspace context marker")
     db.update_session_cwd(entry.session_id, str(project))
     assert db.get_session(entry.session_id)["system_prompt"] is None
-    sends = []
-    class Adapter:
-        async def send(self, chat_id, text, metadata=None):
+    from plugins.platforms.discord.adapter import DiscordAdapter
+    sends, edits = [], []
+    class FakeMessage:
+        async def edit(self, *, content):
             committed = db.get_messages_as_conversation(entry.session_id)[-1]
-            sends.append((chat_id, text, metadata,
+            edits.append(("203", content,
                           bool(committed.get("codex_reasoning_items") or committed["content"] == "Acknowledged summary")))
-            if case == "completion_send_failure" and text.startswith("上下文压缩已完成"):
+            if case == "completion_edit_failure":
+                raise RuntimeError("Discord edit failed")
+    class FakeChannel:
+        async def send(self, *, content, reference=None):
+            sends.append((content, reference))
+            if case == "start_send_failure":
                 raise RuntimeError("Discord send failed")
-            return NS(success=True)
-    adapter = Adapter()
+            return NS(id=203)
+        def get_partial_message(self, message_id):
+            assert message_id == 203
+            return FakeMessage()
+    channel = FakeChannel()
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
+    adapter._client = object()
+    async def resolve(channel_id):
+        assert channel_id == "thread-007"
+        return channel
+    adapter._resolve_channel = resolve
+    metadata_seen = []
+    real_send, real_edit = adapter.send, adapter.edit_message
+    async def capture_send(chat_id: str, content: str, reply_to: str | None = None,
+                           metadata: dict | None = None):
+        metadata_seen.append((chat_id, dict(metadata or {})))
+        return await real_send(chat_id, content, reply_to=reply_to, metadata=metadata)
+    async def capture_edit(chat_id: str, message_id: str, content: str, *,
+                           finalize: bool = False, metadata: dict | None = None):
+        metadata_seen.append((chat_id, dict(metadata or {})))
+        return await real_edit(chat_id, message_id, content, finalize=finalize, metadata=metadata)
+    adapter.send = capture_send
+    adapter.edit_message = capture_edit
     runner = NS(session_store=store, config=GatewayConfig(), _running=True,
                 _restored_source=lambda e: e.origin,
                 _profile_scope_for_source=lambda s: nullcontext(),
@@ -131,11 +158,13 @@ async def test_restored_missing_prompt_reaches_fake_provider_and_retires(tmp_pat
             def refuse(*args, **kwargs):
                 raise OSError("checkpoint storage unavailable")
             monkeypatch.setattr(SessionDB, "attach_native_checkpoint", refuse)
-        if case in ("tick_false", "tick_raise"):
+        if case in ("tick_false", "tick_raise", "tick_cancel"):
             def declined(agent, sid, cancellation):
                 agent._native_idle_start_callback()
                 if case == "tick_raise":
                     raise RuntimeError("maintenance failed")
+                if case == "tick_cancel":
+                    cancellation.set()
                 return False
             monkeypatch.setattr(native_idle, "_idle_tick", declined)
         if case == "postcommit_cancel":
@@ -147,12 +176,13 @@ async def test_restored_missing_prompt_reaches_fake_provider_and_retires(tmp_pat
                 return committed
             monkeypatch.setattr(native_idle, "_idle_tick", cancel_after_commit)
         if case == "completion_schedule_failure":
-            make_notice = native_idle._native_idle_thread_notice_callback
-            def cannot_schedule(source, adapter, loop, home, text, *, muted=False):
-                if text.startswith("上下文压缩已完成"):
-                    raise RuntimeError("loop cannot schedule")
-                return make_notice(source, adapter, loop, home, text, muted=muted)
-            monkeypatch.setattr(native_idle, "_native_idle_thread_notice_callback", cannot_schedule)
+            original_schedule = native_idle._IdleThreadNotice._schedule
+            def cannot_schedule(self, coroutine):
+                if coroutine.cr_code.co_name == "_edit":
+                    coroutine.close()
+                    return None
+                return original_schedule(self, coroutine)
+            monkeypatch.setattr(native_idle._IdleThreadNotice, "_schedule", cannot_schedule)
         if case in {"delegation_running", "delegation_finalizing", "completion_pending",
                     "completion_delivered", "completion_dropped", "other_parent"}:
             state = {"delegation_running": "running", "delegation_finalizing": "finalizing",
@@ -182,19 +212,19 @@ async def test_restored_missing_prompt_reaches_fake_provider_and_retires(tmp_pat
         skipped = case in {"fresh_activity", "delegation_running", "delegation_finalizing",
                            "completion_pending", "ledger_unavailable"}
         async def finished():
-            expected_sends = 0 if skipped else (1 if case in (
-                "persist_failure", "tick_false", "tick_raise", "completion_schedule_failure",
-                "postcommit_cancel") else 2)
+            expected_sends = 0 if skipped else 1
+            expected_edits = 0 if skipped or case in ("completion_schedule_failure", "start_send_failure") else 1
             while (entry.session_id in restored._entries
                    or restored._worker_count
-                   or (not skipped and case not in ("tick_false", "tick_raise") and not fake_wire)
-                   or len(sends) < expected_sends):
+                   or (not skipped and case not in ("tick_false", "tick_raise", "tick_cancel") and not fake_wire)
+                   or len(sends) < expected_sends or len(edits) < expected_edits):
                 await asyncio.sleep(.02)
         await asyncio.wait_for(finished(), timeout=10)
-        if skipped or case in ("tick_false", "tick_raise"):
+        if skipped or case in ("tick_false", "tick_raise", "tick_cancel"):
             assert not fake_wire
             assert len(sends) == (0 if skipped else 1)
-            assert all("上下文压缩已完成" not in notice[1] for notice in sends)
+            expected = "-# ⏸ 上下文压缩已取消。" if case == "tick_cancel" else "-# ⚠ 上下文压缩未完成，原始记录已保留。"
+            assert edits == ([] if skipped else [("203", expected, False)])
             assert runner._agent_cache[entry.session_key][0] is original
             assert not db.get_messages_as_conversation(entry.session_id)[-1].get("codex_reasoning_items")
             assert db.get_session(entry.session_id)["end_reason"] is None
@@ -225,17 +255,19 @@ async def test_restored_missing_prompt_reaches_fake_provider_and_retires(tmp_pat
                 assert history_after[-1]["codex_reasoning_items"][-1]["encrypted_content"] == "opaque-test-checkpoint"
             assert entry.session_key not in runner._agent_cache
             assert original._session_messages == []
-        assert sends[0][0] == "thread-007" and "正在后台压缩" in sends[0][1]
-        assert sends[0][2]["thread_id"] == "thread-007"
-        assert sends[0][2]["_interim_send"] is True
-        if case not in ("persist_failure", "completion_schedule_failure", "postcommit_cancel"):
-            assert len(sends) == 2
-            assert sends[1][0] == "thread-007"
-            assert sends[1][1] == "上下文压缩已完成，下次对话会接续压缩结果。"
-            assert sends[1][2] == sends[0][2]
-            assert sends[1][3] is True  # completion follows persisted checkpoint or summary
+        assert sends == [("-# ⏳ 正在压缩上下文…", None)]
+        assert adapter._last_self_message_id.get("thread-007") is None
+        if case != "start_send_failure":
+            assert "203" in adapter._nonconversational_messages
+        assert metadata_seen == [("thread-007", {
+            "thread_id": "thread-007", "non_conversational": True, "_interim_send": True})] * (1 if case in ("completion_schedule_failure", "start_send_failure") else 2)
+        assert len(db.get_messages_as_conversation(entry.session_id)) == 2
+        if case in ("completion_schedule_failure", "start_send_failure"):
+            assert not edits
         else:
-            assert len(sends) == 1  # rejected persistence or scheduling cannot claim success
+            final = ("-# ⚠ 上下文压缩未完成，原始记录已保留。" if case == "persist_failure"
+                     else "-# ✓ 上下文已压缩，下次对话将接续压缩结果。")
+            assert edits == [("203", final, case != "persist_failure")]
         assert entry.session_id not in IdleTimetable(table.path)._read()["entries"]
         restored.stop()
         if case in ("persist_failure", "fallback_success"):

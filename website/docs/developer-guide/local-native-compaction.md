@@ -43,17 +43,22 @@ session-turn lease. A short atomic commit checks that no foreground turn owns
 the lease and the message watermark is unchanged.
 
 For a Discord session originating in a thread, an eligible background pass
-sends one brief start notice to that same thread when native `/responses`
-maintenance begins (or when ordinary summary fallback actually starts if the
-native request could not begin). This is independent of routine
-`compression.progress_notices`. Skipped, below-floor, stale or pre-start
-cancelled timers stay silent. A failed native attempt followed by summary
-fallback does not send a second start notice. Once a native checkpoint or
-ordinary fallback is durably committed, the same original Discord thread also
-receives “上下文压缩已完成，下次对话会接续压缩结果。” Failed persistence, cancellation,
-and skipped checks do not receive a completion notice. Neither notice creates a
-session message; delivery failure does not change the committed result.
-Channel/DM sessions and other platforms receive no notice.
+sends one small, gray `-# ⏳ 正在压缩上下文…` status to the originating thread
+when native `/responses` maintenance begins (or when ordinary summary fallback
+actually starts if the native request could not begin). On durable native or
+ordinary summary commit, it edits that **same message** to
+`-# ✓ 上下文已压缩，下次对话将接续压缩结果。`. If an already-started pass ends
+without a commit, it edits to `-# ⚠ 上下文压缩未完成，原始记录已保留。` or, when
+cancelled, `-# ⏸ 上下文压缩已取消。`. A later foreground turn does not undo
+an already committed checkpoint. Start and end use the owning profile's adapter,
+exact thread and non-conversational metadata. The edit waits for a slow start
+send to return its message ID without blocking compression. An absent ID or
+failed send/edit never triggers a second message and never changes compression.
+This is independent of routine `compression.progress_notices`; skipped,
+below-floor, stale or pre-start cancelled checks stay silent. A native failure
+followed by ordinary fallback does not send another start notice. No notice
+enters the session transcript or the next model context. Channel/DM sessions
+and other platforms receive no notice.
 
 Maintenance logs distinguish full-request *rough before* pressure from actual
 maintenance request `usage_input/usage_cached/usage_output`; after-checkpoint

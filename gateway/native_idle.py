@@ -23,42 +23,94 @@ def enabled():
                 and (compression.get("codex_responses_native_idle_after_seconds") or 0) > 0)
 
 
-def native_idle_start_callback(source, adapter, loop, profile_home, *, muted=False):
-    """One non-conversational start notice in the originating Discord thread."""
-    return _native_idle_thread_notice_callback(
-        source, adapter, loop, profile_home,
-        "正在后台压缩此帖的上下文，原始记录会保留。", muted=muted)
+_IDLE_START = "-# ⏳ 正在压缩上下文…"
+_IDLE_END = {
+    "completed": "-# ✓ 上下文已压缩，下次对话将接续压缩结果。",
+    "failed": "-# ⚠ 上下文压缩未完成，原始记录已保留。",
+    "cancelled": "-# ⏸ 上下文压缩已取消。",
+}
 
 
-def _native_idle_thread_notice_callback(source, adapter, loop, profile_home, text, *, muted=False):
-    from gateway.config import Platform
-    from agent.async_utils import safe_schedule_threadsafe
-    from gateway.run import _async_profile_runtime_scope, _interim_metadata, _non_conversational_metadata
-    thread_id = str(getattr(source, "thread_id", "") or "")
-    if source.platform != Platform.DISCORD or not thread_id or adapter is None or muted:
-        return None
-    metadata = _interim_metadata(_non_conversational_metadata(
-        {"thread_id": thread_id}, platform=Platform.DISCORD))
+class _IdleThreadNotice:
+    """One pass owns one Discord message; completion waits for its start send."""
 
-    async def send_notice():
-        try:
-            async with asyncio.timeout(10):
-                async with _async_profile_runtime_scope(profile_home):
-                    result = await adapter.send(thread_id, text, metadata=metadata)
-            if not getattr(result, "success", False):
-                logger.debug("Discord idle notice not delivered to %s", thread_id)
-        except Exception:
-            logger.debug("Discord idle notice failed for %s", thread_id, exc_info=True)
+    def __init__(self, adapter, loop, profile_home, thread_id, metadata):
+        self.adapter = adapter
+        self.loop = loop
+        self.profile_home = profile_home
+        self.thread_id = thread_id
+        self.metadata = metadata
+        self._start = None
+        self._started = False
+        self._finished = False
 
-    def notify():
+    def _schedule(self, coroutine):
+        from agent.async_utils import safe_schedule_threadsafe
         future = safe_schedule_threadsafe(
-            send_notice(), loop, logger=logger, log_message="Idle compaction notice scheduling error")
+            coroutine, self.loop, logger=logger, log_message="Idle compaction notice scheduling error")
         if future is not None:
             def observe(done):
                 with suppress(Exception):
                     done.result()
             future.add_done_callback(observe)
-    return notify
+        return future
+
+    def __call__(self):
+        if self._started:
+            return
+        self._started = True
+        self._start = self._schedule(self._send())
+
+    async def _send(self):
+        from gateway.run import _async_profile_runtime_scope
+        try:
+            async with asyncio.timeout(10):
+                async with _async_profile_runtime_scope(self.profile_home):
+                    result = await self.adapter.send(self.thread_id, _IDLE_START, metadata=self.metadata)
+            if getattr(result, "success", False) and getattr(result, "message_id", None):
+                return str(result.message_id)
+            logger.debug("Discord idle notice not delivered to %s", self.thread_id)
+        except Exception:
+            logger.debug("Discord idle notice failed for %s", self.thread_id, exc_info=True)
+        return None
+
+    def finish(self, status):
+        if self._finished or not self._started or self._start is None:
+            return
+        self._finished = True
+        self._schedule(self._edit(status))
+
+    async def _edit(self, status):
+        from gateway.run import _async_profile_runtime_scope
+        try:
+            # The start send may be slow even after the durable commit. Await it
+            # on the loop, never on the compression worker, before editing its ID.
+            start = self._start
+            if start is None:
+                return
+            message_id = await asyncio.wrap_future(start)
+            if not message_id:
+                return
+            async with asyncio.timeout(10):
+                async with _async_profile_runtime_scope(self.profile_home):
+                    result = await self.adapter.edit_message(
+                        self.thread_id, message_id, _IDLE_END[status], metadata=self.metadata)
+            if not getattr(result, "success", False):
+                logger.debug("Discord idle notice edit failed for %s", self.thread_id)
+        except Exception:
+            logger.debug("Discord idle notice edit failed for %s", self.thread_id, exc_info=True)
+
+
+def native_idle_start_callback(source, adapter, loop, profile_home, *, muted=False):
+    """Bind a pass to its originating Discord thread and owning profile."""
+    from gateway.config import Platform
+    from gateway.run import _interim_metadata, _non_conversational_metadata
+    thread_id = str(getattr(source, "thread_id", "") or "")
+    if source.platform != Platform.DISCORD or not thread_id or adapter is None or muted:
+        return None
+    metadata = _interim_metadata(_non_conversational_metadata(
+        {"thread_id": thread_id}, platform=Platform.DISCORD))
+    return _IdleThreadNotice(adapter, loop, profile_home, thread_id, metadata)
 
 
 def _profile_homes(runner):
@@ -240,28 +292,27 @@ def _execute(runner, home, loop, sid, item, cancellation):
                 agent._native_idle_cancel = cancellation
                 agent._native_idle_handle = True
                 adapter = runner._delivery_adapter_for(source)
-                agent._native_idle_start_callback = native_idle_start_callback(
+                notice = native_idle_start_callback(
                     source, adapter, loop, home) if source.platform == Platform.DISCORD else None
+                setattr(agent, "_native_idle_start_callback", notice)
                 timetable = for_home(home)
                 with timetable._condition:
                     timetable._active_agents[sid] = agent
-                committed = _idle_tick(agent, sid, cancellation)
-                if committed:
-                    if original is not None:
+                committed = False
+                try:
+                    committed = _idle_tick(agent, sid, cancellation)
+                    if committed and original is not None:
                         _evict_compacted_cache(runner, timetable, sid, item, original)
-                    # Only the durable commit (native or ordinary fallback) may
-                    # claim completion; a cancellation during teardown stays silent.
-                    # Delivery must not alter the committed result.
-                    if not cancellation.is_set():
+                    return committed
+                finally:
+                    if notice is not None:
                         try:
-                            notice = _native_idle_thread_notice_callback(
-                                source, adapter, loop, home,
-                                "上下文压缩已完成，下次对话会接续压缩结果。")
-                            if notice is not None:
-                                notice()
+                            # Commit wins over a later foreground cancellation: a new
+                            # turn cannot undo a checkpoint already durably attached.
+                            notice.finish("completed" if committed else
+                                          "cancelled" if cancellation.is_set() else "failed")
                         except Exception:
-                            logger.debug("Discord idle completion notice failed for %s", sid, exc_info=True)
-                return committed
+                            logger.debug("Discord idle notice finalization failed for %s", sid, exc_info=True)
             finally:
                 if agent is not None:
                     cancel_idle(agent, timetable=False)

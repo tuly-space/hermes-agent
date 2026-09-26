@@ -21,8 +21,13 @@ def _adapter(thread_id):
     sent = asyncio.Event()
     async def send(**kw):
         sent.set()
-        return NS(id=f"message-in-{thread_id}")
-    channel = NS(send=AsyncMock(side_effect=send))
+        return NS(id=101)
+    edited = asyncio.Event()
+    message = NS(edit=AsyncMock(side_effect=lambda **kw: edited.set()))
+    channel = NS(send=AsyncMock(side_effect=send),
+                 get_partial_message=Mock(return_value=message))
+    channel.message = message
+    channel.edited = edited
     resolved = []
 
     async def resolve(target):
@@ -139,8 +144,7 @@ async def test_real_idle_timer_routes_one_start_to_thread_even_after_turn_done(
     assert summary.call_count == fallbacks
     if notices:
         text = channel.send.await_args.kwargs["content"]
-        assert "正在后台压缩" in text and "原始记录会保留" in text
-        assert "成功" not in text
+        assert text == "-# ⏳ 正在压缩上下文…"
         assert adapter._last_self_message_id.get("thread-1") is None
     assert [row["content"] for row in db.get_messages_as_conversation("idle-thread")] == [
         "Saved fact", "Acknowledged"]
@@ -239,47 +243,110 @@ def test_callback_failure_does_not_block_native_or_repeat_on_summary(prepared, m
 
 
 @pytest.mark.asyncio
+async def test_slow_start_is_edited_in_order_without_blocking_compaction(prepared):
+    agent, _, _ = prepared
+    adapter, sent, channel, _ = _adapter("thread-1")
+    release = asyncio.Event()
+    original = channel.send.side_effect
+    async def slow_send(**kwargs):
+        sent.set()
+        await release.wait()
+        return await original(**kwargs)
+    channel.send.side_effect = slow_send
+    notice = _wire(agent, adapter, asyncio.get_running_loop())
+    await asyncio.to_thread(notice)
+    await asyncio.to_thread(notice.finish, "completed")
+    await asyncio.wait_for(sent.wait(), timeout=2)
+    assert channel.message.edit.await_count == 0
+    release.set()
+    await asyncio.wait_for(channel.edited.wait(), timeout=2)
+    assert channel.send.await_count == channel.message.edit.await_count == 1
+    assert channel.get_partial_message.call_args.args == (101,)
+    assert channel.message.edit.await_args.kwargs["content"].startswith("-# ✓")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["send_failed", "missing_id", "send_raised", "edit_failed"])
+async def test_notice_delivery_failures_do_not_create_second_message(prepared, failure):
+    agent, db, _ = prepared
+    adapter, sent, channel, _ = _adapter("thread-1")
+    if failure == "send_failed":
+        channel.send.side_effect = RuntimeError("transport send failed")
+    elif failure == "missing_id":
+        adapter.send = AsyncMock(return_value=NS(success=True, message_id=None))
+    elif failure == "send_raised":
+        adapter.send = AsyncMock(side_effect=RuntimeError("callback send failed"))
+    else:
+        channel.message.edit.side_effect = RuntimeError("edit unavailable")
+    notice = _wire(agent, adapter, asyncio.get_running_loop())
+    await asyncio.to_thread(notice)
+    await asyncio.to_thread(notice.finish, "completed")
+    assert notice._start is not None
+    await asyncio.wrap_future(notice._start)
+    await asyncio.sleep(0.05)
+    if failure in ("missing_id", "send_raised"):
+        assert channel.send.await_count == 0
+    else:
+        assert channel.send.await_count == 1
+    assert channel.message.edit.await_count == (1 if failure == "edit_failed" else 0)
+    assert [r["content"] for r in db.get_messages_as_conversation("idle-thread")] == [
+        "Saved fact", "Acknowledged"]
+
+
+@pytest.mark.asyncio
+async def test_started_cancellation_edits_same_notice(prepared):
+    agent, _, _ = prepared
+    adapter, sent, channel, _ = _adapter("thread-1")
+    notice = _wire(agent, adapter, asyncio.get_running_loop())
+    await asyncio.to_thread(notice)
+    await asyncio.wait_for(sent.wait(), timeout=2)
+    await asyncio.to_thread(notice.finish, "cancelled")
+    await asyncio.wait_for(channel.edited.wait(), timeout=2)
+    assert channel.send.await_count == 1
+    assert channel.message.edit.await_args.kwargs["content"] == "-# ⏸ 上下文压缩已取消。"
+
+
+@pytest.mark.asyncio
 async def test_deferred_notices_restore_origin_profile_a_b_a(prepared, monkeypatch, tmp_path):
-    from gateway.native_idle import _native_idle_thread_notice_callback
+    from gateway.native_idle import native_idle_start_callback
     from hermes_constants import get_hermes_home
     agent, _, _ = prepared
     loop = asyncio.get_running_loop()
     homes = [tmp_path / "a", tmp_path / "b", tmp_path / "a"]
-    callbacks = []
-    seen = []
-    transports = []
+    callbacks, transports, scopes = [], [], []
     for index, home in enumerate(homes):
         home.mkdir(exist_ok=True)
         monkeypatch.setenv("HERMES_HOME", str(home))
         adapter, _, channel, routes = _adapter(f"thread-{index}")
         transports.append((adapter, channel, routes, f"thread-{index}"))
-        async def record(*, content, reference=None, target=index):
-            seen.append((target, get_hermes_home(), content))
-            return NS(id=f"message-{target}")
-        channel.send.side_effect = record
+        original_send = channel.send.side_effect
+        original_edit = channel.message.edit.side_effect
+        async def record_send(*, content, reference=None, target=index, original=original_send):
+            scopes.append((target, get_hermes_home(), "send"))
+            return await original(content=content, reference=reference)
+        async def record_edit(*, content, target=index, original=original_edit):
+            scopes.append((target, get_hermes_home(), "edit"))
+            return original(content=content)
+        channel.send.side_effect = record_send
+        channel.message.edit.side_effect = record_edit
         callbacks.append(_wire(agent, adapter, loop, thread_id=f"thread-{index}"))
-        callbacks.append(_native_idle_thread_notice_callback(
-            SessionSource(platform=Platform.DISCORD, chat_id="parent", chat_type="thread",
-                          thread_id=f"thread-{index}"), adapter, loop, home,
-            "上下文压缩已完成，下次对话会接续压缩结果。"))
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "ambient"))
     for callback in callbacks:
         await asyncio.to_thread(callback)
-    async def all_arrived():
-        while len(seen) < len(callbacks):
-            await asyncio.sleep(0.01)
-    await asyncio.wait_for(all_arrived(), timeout=2)
-    assert sorted((target, home) for target, home, _ in seen) == sorted(
-        (index, home) for index, home in enumerate(homes) for _ in range(2))
-    assert sum(text == "上下文压缩已完成，下次对话会接续压缩结果。" for _, _, text in seen) == len(homes)
+        await asyncio.to_thread(callback.finish, "completed")
+    await asyncio.wait_for(asyncio.gather(*(channel.edited.wait() for _, channel, _, _ in transports)), timeout=2)
+    assert sorted(scopes) == sorted((index, home, phase)
+                                    for index, home in enumerate(homes) for phase in ("send", "edit"))
     for adapter, channel, routes, thread_id in transports:
         assert routes == [thread_id, thread_id]
-        assert channel.send.await_count == 2
+        assert channel.send.await_count == channel.message.edit.await_count == 1
+        assert channel.get_partial_message.call_args.args == (101,)
+        assert channel.message.edit.await_args.kwargs["content"] == "-# ✓ 上下文已压缩，下次对话将接续压缩结果。"
         assert adapter._last_self_message_id.get(thread_id) is None
-    assert _native_idle_thread_notice_callback(
+    assert native_idle_start_callback(
         SessionSource(platform=Platform.DISCORD, chat_id="dm", chat_type="dm"),
-        transports[0][0], loop, homes[0], "completed") is None
-    assert _native_idle_thread_notice_callback(
+        transports[0][0], loop, homes[0]) is None
+    assert native_idle_start_callback(
         SessionSource(platform=Platform.TELEGRAM, chat_id="parent", chat_type="thread", thread_id="thread-0"),
-        transports[0][0], loop, homes[0], "completed") is None
+        transports[0][0], loop, homes[0]) is None
     assert get_hermes_home() == tmp_path / "ambient"
