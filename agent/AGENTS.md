@@ -79,16 +79,26 @@ Manual `/compress` on every surface (CLI, gateway, TUI, ACP) runs through
 `agent/conversation_compression_manual.py::compress_now` (one parser for `here [N]` / focus /
 `--preview` / `--aggressive`; surfaces only parse their own argv, install `after_messages` and render).
 
-Two layers: gateway session hygiene (85% threshold) and the agent `ContextCompressor` (50%,
-configurable; per-model overrides; failure cooldown after provider-proven overflow). The algorithm
-prunes old tool results first (no LLM call), then picks boundaries, then generates a structured
-summary with the `auxiliary` compression model. In-place compaction keeps a single stable session
-id; native Responses/Codex compaction paths are provider-specific. A stalled summary stream retries
-once on `auxiliary.compression.fallback_chain`, and a repeated stall (a stall-class failure already on
-the cooldown ladder) ends with the deterministic fallback summary through the same pipeline — never a
-prune committed outside the lease/fence. Compression is the sanctioned
-cache break — keep it the only one. Full detail:
-`website/docs/developer-guide/context-compression-and-caching.md`.
+Automatic compaction has one decision point at the assembled pre-API request gate
+(`agent/turn_preflight.py`): combine resumed-session idle, token pressure, effective request message
+count and engine maintenance into one `_compress_context` chain. Gateway, turn-start and post-tool
+paths must not start competing automatic compression; tool-result growth is checked before the next
+request. Cold sessions are considered on resume, not by a background idle timer. Manual `/compress`
+and provider-proven overflow retain their separate recovery entry points.
+
+Eligible native Responses/Codex maintenance runs first; ordinary failure falls back to the auxiliary
+summary. Native checkpoint success waits for real usage; ordinary summaries may be remeasured and
+retried within the existing budget, but waiting for usage must not trigger another idle summary.
+Preserve cooldown, locks, cancellation, commit fences and review-fork guards. Native waits are bounded
+by the effective auxiliary timeout policy; cancellation or stale-input/CAS refusal must not publish
+late results, summarize old input or send an outdated request. Emit the existing scenario-appropriate
+status once per combined decision, without another start notice on fallback.
+
+In-place compaction keeps a stable session id. A stalled summary stream retries once on
+`auxiliary.compression.fallback_chain`; repeated stalls use the deterministic fallback through the
+same lease/fence pipeline. Compression is the sanctioned cache break — keep it the only one.
+See `website/docs/developer-guide/local-native-compaction.md` for the local integration and
+`website/docs/developer-guide/context-compression-and-caching.md` for the underlying pipeline.
 
 ## Model and provider resolution
 
