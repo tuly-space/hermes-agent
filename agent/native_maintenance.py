@@ -59,9 +59,17 @@ def attempt(agent: Any, messages: list[dict], system_prompt: str, before_tokens:
     The SDK's high-level stream loses output_item.done on an empty completed.output,
     so consume the raw events with the production assembler. No output is delivered.
     """
-    agent._native_maintenance_abort_fallback = False
+    def _abort_fallback():
+        # A detached worker must not poison a later turn's outcome on the agent.
+        if commit_fence is not None:
+            commit_fence._native_abort_fallback = True
+        else:
+            agent._native_maintenance_abort_fallback = True
+
+    if commit_fence is not None:
+        commit_fence._native_abort_fallback = False
     if not eligible(agent) or not messages or getattr(agent, "_interrupt_requested", False):
-        agent._native_maintenance_abort_fallback = True
+        _abort_fallback()
         return False
     carrier = next((m for m in reversed(messages) if m.get("role") == "assistant"), None)
     if carrier is None:
@@ -73,7 +81,7 @@ def attempt(agent: Any, messages: list[dict], system_prompt: str, before_tokens:
         # A durable attempt must have a durable carrier. Never publish an ephemeral
         # checkpoint which disappears as soon as the agent is evicted.
         if not isinstance(expected_watermark, int):
-            agent._native_maintenance_abort_fallback = True
+            _abort_fallback()
             return False
         # The checkpoint covers ALL input, not just its assistant carrier. An
         # unpersisted or changed tail would move its boundary and lose context.
@@ -83,13 +91,13 @@ def attempt(agent: Any, messages: list[dict], system_prompt: str, before_tokens:
                 or any(m.get("role") != d.get("role")
                        or db._loaded_view_content(m.get("role"), m.get("content")) != d.get("content")
                        or m.get("tool_calls") != d.get("tool_calls") for m, d in zip(plain, durable))):
-            agent._native_maintenance_abort_fallback = True
+            _abort_fallback()
             return False
         for m, d in zip(plain, durable):
             m["_row_id"] = d["_row_id"]
         row_id = carrier.get("_row_id")
         if not isinstance(row_id, int):
-            agent._native_maintenance_abort_fallback = True
+            _abort_fallback()
             return False
     started = time.monotonic()
     client = stream = None
@@ -152,25 +160,40 @@ def attempt(agent: Any, messages: list[dict], system_prompt: str, before_tokens:
         # suffix makes an assistant/tool-ended transcript a closed, inert request.
         kwargs["input"] = list(kwargs["input"]) + [{"role": "user", "content":
             "Prepare the handoff. Reply only READY."}]
-        if sol_route:
-            from agent.auxiliary_client import _effective_aux_timeout
-            kwargs["timeout"] = _effective_aux_timeout("compression", None)
-        else:
-            kwargs["timeout"] = min(float(kwargs.get("timeout") or 300), 300.0)
+        from agent.auxiliary_client import _effective_aux_timeout
+        kwargs["timeout"] = _effective_aux_timeout("compression", None)
         kwargs = agent._get_transport().preflight_kwargs(
             kwargs, allow_stream=True, is_github_responses=route.is_github_responses,
             sanitize_harmony_tokens=route.is_codex_backend,
         )
         kwargs = _sanitize_consumer_codex_request(agent, kwargs)
         kwargs["stream"] = True
+        if commit_fence is not None and commit_fence.is_cancelled:
+            _abort_fallback()
+            reason = "commit_admission_revoked"
+            return False
         client = agent._create_request_openai_client(reason="native_maintenance", api_kwargs=kwargs)
+        if commit_fence is not None and commit_fence.is_cancelled:
+            _abort_fallback()
+            reason = "commit_admission_revoked"
+            return False
         stream = client.responses.create(**bypass_sdk_request_transform(kwargs))
         terminal_seen = False
         def _terminal_event(event):
             nonlocal terminal_seen
+            if commit_fence is not None:
+                commit_fence.touch_progress()
             if _event_field(event, "type") == "response.completed":
                 terminal_seen = True
-        result = _consume_codex_event_stream(stream, model=kwargs["model"], on_event=_terminal_event)
+        def _interrupted():
+            return bool(getattr(agent, "_interrupt_requested", False)
+                        or (commit_fence is not None and commit_fence.is_cancelled))
+        result = _consume_codex_event_stream(
+            stream, model=kwargs["model"], on_event=_terminal_event, interrupt_check=_interrupted)
+        if _interrupted():
+            _abort_fallback()
+            reason = "commit_admission_revoked"
+            return False
         input_tokens, cached_tokens, output_tokens = _usage(result.usage)
         if not terminal_seen or result.status != "completed":
             reason = "truncated_stream" if not terminal_seen else f"response_{result.status}"
@@ -195,7 +218,7 @@ def attempt(agent: Any, messages: list[dict], system_prompt: str, before_tokens:
             checkpoint["_checkpoint_prefix_digest"] = _prefix_digest(covered)
         if commit_fence is not None and not commit_fence.begin_commit():
             reason = "commit_admission_revoked"
-            agent._native_maintenance_abort_fallback = True
+            _abort_fallback()
             return False
         try:
             if db is not None and sid and not getattr(agent, "_persist_disabled", False):
@@ -207,11 +230,11 @@ def attempt(agent: Any, messages: list[dict], system_prompt: str, before_tokens:
                 except Exception:
                     # A competing foreground admission is a refused CAS, never
                     # permission to begin an ordinary summary on stale input.
-                    agent._native_maintenance_abort_fallback = True
+                    _abort_fallback()
                     raise
                 if not attached:
                     reason = "stale_transcript_or_lease"
-                    agent._native_maintenance_abort_fallback = True
+                    _abort_fallback()
                     return False
             # Only mutate the in-memory sidecar AFTER the durable CAS succeeded.
             carrier["codex_reasoning_items"] = list(carrier.get("codex_reasoning_items") or []) + [checkpoint]

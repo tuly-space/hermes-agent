@@ -74,12 +74,7 @@ def _make_tool_defs(*names: str) -> list:
 
 
 def _pressured_compressor() -> MagicMock:
-    """A compressor that always reports context pressure after tools run.
-
-    ``should_defer_preflight_to_real_usage`` returns True so the turn-start
-    preflight and the pre-API pressure gate stand down — isolating the
-    post-tool gate as the only compression site under test.
-    """
+    """A compressor that reports pressure on the assembled post-tool request."""
     compressor = MagicMock()
     compressor.protect_first_n = 3
     compressor.protect_last_n = 20
@@ -88,8 +83,11 @@ def _pressured_compressor() -> MagicMock:
     compressor.last_prompt_tokens = 150_000
     compressor.awaiting_real_usage_after_compression = False
     compressor.should_compress.return_value = True
-    compressor.should_defer_preflight_to_real_usage.return_value = True
+    # First assembled request defers to usage; subsequent tool-result requests
+    # are admitted through that same pre-API gate, not a post-tool side path.
+    compressor.should_defer_preflight_to_real_usage.side_effect = lambda _t: False
     compressor.get_active_compression_failure_cooldown.return_value = None
+    compressor._automatic_compression_blocked.return_value = False
     return compressor
 
 
@@ -152,8 +150,9 @@ def _run_tool_loop(agent, n_tool_iterations: int):
 
 
 class TestPostToolCompressionAttemptCap:
-    def test_post_tool_gate_waits_for_usage_after_native_checkpoint(self, agent):
+    def test_first_request_defers_to_usage_before_tool_pressure(self, agent):
         agent.context_compressor.awaiting_real_usage_after_compression = True
+        agent.context_compressor.should_defer_preflight_to_real_usage.side_effect = lambda _t: True
 
         result, compress_calls = _run_tool_loop(agent, n_tool_iterations=1)
 
@@ -184,12 +183,7 @@ class TestPostToolCompressionAttemptCap:
         check), then keep the pressure on through tool iterations: the
         combined total must still respect the cap.
         """
-        # First pre-API check does not defer → pre-API gate fires once;
-        # afterwards defer again so only the post-tool gate keeps firing.
-        defers = iter([False])
-        agent.context_compressor.should_defer_preflight_to_real_usage.side_effect = (
-            lambda _t: next(defers, True)
-        )
+        # Every iteration spends the same bounded pre-API attempt budget.
         result, compress_calls = _run_tool_loop(agent, n_tool_iterations=7)
 
         assert result["completed"] is True

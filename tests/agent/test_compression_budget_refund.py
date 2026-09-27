@@ -159,6 +159,8 @@ def _coherent_compressor() -> MagicMock:
     compressor.should_compress.side_effect = lambda t=None: (t or 0) >= THRESHOLD
     compressor.should_defer_preflight_to_real_usage.return_value = False
     compressor.get_active_compression_failure_cooldown.return_value = None
+    compressor._automatic_compression_blocked.return_value = False
+    compressor.should_compress_preflight.return_value = False
 
     def _update_from_response(usage):
         compressor.last_prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)

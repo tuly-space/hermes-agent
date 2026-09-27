@@ -14,7 +14,6 @@ from typing import Any, Dict, Optional, Tuple
 
 from agent.message_metadata import append_message
 from agent.message_sanitization import coalesce_tool_call_id
-from agent.turn_preflight import compress_after_tool_results
 from agent.turn_tool_validation import validate_tool_calls
 
 logger = logging.getLogger("agent.conversation_loop")
@@ -185,21 +184,8 @@ def run_tool_round(
     if {tc.function.name for tc in assistant_message.tool_calls} == {"execute_code"}:
         agent.iteration_budget.refund()
 
-    _ptc = compress_after_tool_results(
-        agent, messages=messages, system_message=system_message, user_message=user_message,
-        active_system_prompt=active_system_prompt, conversation_history=conversation_history,
-        compression_attempts=compression_attempts,
-        max_compression_attempts=max_compression_attempts, effective_task_id=effective_task_id,
-        final_response=final_response, turn_exit_reason=_turn_exit_reason,
-    )
-    messages = _ptc.messages
-    active_system_prompt = _ptc.active_system_prompt
-    conversation_history = _ptc.conversation_history
-    compression_attempts = _ptc.compression_attempts
-    final_response = _ptc.final_response
-    _turn_exit_reason = _ptc.turn_exit_reason
-    if _ptc.end_turn:
-        return _verdict("break")
+    # The next iteration assembles and measures the full request, including tool
+    # results. No second automatic post-tool admission (or duplicate status) here.
 
     # Save session log incrementally (so progress is visible even if interrupted)
     agent._session_messages = messages

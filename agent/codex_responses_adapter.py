@@ -767,6 +767,12 @@ def has_replayable_native_compaction_checkpoint(
     return has_compaction_checkpoint(items)
 
 
+def effective_native_responses_message_count(agent: Any, messages: List[Dict[str, Any]]) -> Optional[int]:
+    """Count the same checkpoint-pruned items that this route will replay."""
+    items = _native_responses_replay_items(agent, messages)
+    return len(items) if items is not None else None
+
+
 def estimate_native_responses_preflight_tokens(
     agent: Any, messages: List[Dict[str, Any]], *, system_prompt: str = "", tools: Optional[List[Dict[str, Any]]] = None,
 ) -> Optional[int]:

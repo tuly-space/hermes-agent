@@ -1995,6 +1995,12 @@ def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_c
         is_codex_backend=(agent.provider or "").strip().lower() == "openai-codex",
     )
     agent.max_compression_attempts = cs.max_attempts
+    # Former Gateway hygiene knob now belongs to the assembled pre-API decision.
+    _hard_limit = _cfg_dict(_agent_cfg, "compression").get("hygiene_hard_message_limit", 5000)
+    try:
+        agent.compression_hard_message_limit = max(1, int(_hard_limit))
+    except (TypeError, ValueError):
+        agent.compression_hard_message_limit = 5000
     agent.compression_idle_compact_after_seconds = cs.idle_compact_after_seconds
     agent.compression_native_first = cs.codex_responses_native_first
     auxiliary_compression = _cfg_dict(_cfg_dict(_agent_cfg, "auxiliary"), "compression")

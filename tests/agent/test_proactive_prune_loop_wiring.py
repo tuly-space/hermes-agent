@@ -161,7 +161,10 @@ class TestProactivePruneLoopWiring:
         compressor.prune_tool_results_only.assert_not_called()
 
     def test_full_compression_preempts_proactive_prune(self, agent):
-        agent.context_compressor.should_compress.return_value = True
+        agent.context_compressor.should_defer_preflight_to_real_usage.return_value = False
+        agent.context_compressor._automatic_compression_blocked.return_value = False
+        agent.context_compressor.should_compress.side_effect = [True, False]
+        agent.context_compressor.should_compress_preflight.return_value = False
 
         def _compress(messages, system_message, **_kwargs):
             return [dict(m) for m in messages], system_message
@@ -177,7 +180,9 @@ class TestProactivePruneLoopWiring:
 
         assert result["completed"] is True
         compress.assert_called_once()
-        agent.context_compressor.prune_tool_results_only.assert_not_called()
+        # Only the freshly remeasured request may consult the prune hook;
+        # the compressed pass itself never competes with deterministic pruning.
+        agent.context_compressor.prune_tool_results_only.assert_called_once()
 
     def test_prune_consulted_when_compression_stands_down(self, agent):
         calls = []
@@ -190,7 +195,7 @@ class TestProactivePruneLoopWiring:
         result = _run_tool_loop(agent, n_tool_iterations=3)
         assert result["completed"] is True
         assert len(calls) == 3  # one shot per tool iteration
-        assert all(t == 120_000 for t in calls)  # fed the real usage reading
+        assert all(isinstance(t, int) and t > 0 for t in calls)  # assembled request, including tool tails
 
     def test_committed_prune_replaces_messages(self, agent):
         marker = "[old tool output pruned]"
@@ -222,6 +227,7 @@ class TestProactivePruneLoopWiring:
         ``should_compress_info()[0]``, so the only way into this branch with
         ``(True, None)`` is an exhausted per-turn budget."""
         agent.max_compression_attempts = 0  # budget already spent this turn
+        agent.context_compressor.should_defer_preflight_to_real_usage.return_value = False
         agent.context_compressor.should_compress.return_value = True
         agent.context_compressor.should_compress_info.return_value = (True, None)
         agent.context_compressor.prune_tool_results_only = (

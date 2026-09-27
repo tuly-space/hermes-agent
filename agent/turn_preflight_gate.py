@@ -18,7 +18,7 @@ logger = logging.getLogger("agent.conversation_loop")
 
 
 def run_preflight_gate(
-    agent: Any, *, request_pressure_tokens: Any, _moa_prepared_request: Any,
+    agent: Any, *, request_pressure_tokens: Any, api_messages: Any, _moa_prepared_request: Any,
     pending_moa_prepared_request: Any, messages: Any, system_message: Any, user_message: Any,
     active_system_prompt: Any, conversation_history: Any, api_call_count: Any,
     compression_attempts: Any, max_compression_attempts: Any, effective_task_id: Any,
@@ -89,6 +89,7 @@ def run_preflight_gate(
         )
     return run_preflight_compression(
         agent, v, compressor=_compressor, request_pressure_tokens=request_pressure_tokens,
+        api_messages=api_messages, previous_preflight_pressure=_last_preflight_pressure,
         provider_overflow_preflight=_provider_overflow_preflight,
         # An anchored figure is real usage + delta: never deferred. Only a whole-context rough
         # estimate waits for the provider's count.

@@ -243,6 +243,7 @@ class CompressionFacadeMixin:
         )
         reset_context_compression_timeout_outcome(self)
         self._native_maintenance_committed = False
+        self._native_maintenance_abort_fallback = False
         from agent.portal_tags import (
             get_affinity_scope, get_conversation_context, reset_affinity_scope, reset_conversation_context,
             set_affinity_scope, set_conversation_context,
@@ -278,33 +279,79 @@ class CompressionFacadeMixin:
 
             if not force and not focus_topic:
                 from agent.native_maintenance import attempt, before_summary
-                if before_summary(self, messages):
-                    threshold = getattr(getattr(self, "context_compressor", None), "threshold_tokens", 0)
-                    # Auxiliary native is a backend choice after the caller has
-                    # admitted compression (including idle below the size threshold).
-                    if getattr(self, "compression_aux_native", None) is True or (
-                            isinstance(approx_tokens, int) and approx_tokens >= threshold > 0):
-                        db, sid = getattr(self, "_session_db", None), getattr(self, "session_id", None)
-                        try:
-                            # Post-tool/pre-API calls flush their tail before checkpointing.
-                            if db is not None and sid and getattr(self, "_active_session_turn_lease_holder", None):
-                                if self._flush_messages_to_session_db(messages) is False:
-                                    raise RuntimeError("Native maintenance input could not be persisted")
-                            watermark = db.get_active_message_watermark(sid) if db is not None and sid else None
-                            native_ok = attempt(
-                                self, messages, getattr(self, "_cached_system_prompt", None) or system_message or "",
-                                approx_tokens, phase="threshold", expected_watermark=watermark,
-                                turn_lease_holder=getattr(self, "_active_session_turn_lease_holder", None),
-                                commit_fence=active_fence,
+                if before_summary(self, messages) and getattr(self, "compression_enabled", False):
+                    # Flush the tail before snapshotting. The worker must never receive
+                    # the live list: an orphaned native stream can finish after timeout.
+                    db, sid = getattr(self, "_session_db", None), getattr(self, "session_id", None)
+                    native_prompt = getattr(self, "_cached_system_prompt", None) or system_message or ""
+                    holder = getattr(self, "_active_session_turn_lease_holder", None)
+                    try:
+                        if db is not None and sid and holder:
+                            if self._flush_messages_to_session_db(messages) is False:
+                                self._native_maintenance_abort_fallback = True
+                                return messages, system_message
+                        watermark = db.get_active_message_watermark(sid) if db is not None and sid else None
+                    except Exception:
+                        self._native_maintenance_abort_fallback = True
+                        logger.warning("Native maintenance input could not be persisted", exc_info=True)
+                        return messages, system_message
+
+                    def _native_worker(fence):
+                        snapshot = copy.deepcopy(messages)
+                        ok = attempt(
+                            self, snapshot, native_prompt, approx_tokens, phase="threshold",
+                            expected_watermark=watermark, turn_lease_holder=holder, commit_fence=fence,
+                        )
+                        return (snapshot if ok else messages), native_prompt
+
+                    # An externally supplied fence already belongs to its caller's
+                    # bounded waiter. All ordinary pre-API native calls use the host's
+                    # progress timeout, including its interrupt/commit overrun handling.
+                    if commit_fence is not None:
+                        native_result = _native_worker(active_fence)
+                    else:
+                        idle_timeout, total_ceiling = resolve_context_compression_timeouts()
+                        if idle_timeout <= 0:
+                            # Disabling the summary watchdog must not leave a native
+                            # network request unbounded; use its auxiliary call budget.
+                            from agent.auxiliary_client import _effective_aux_timeout
+                            idle_timeout = float(_effective_aux_timeout("compression", None))
+                            total_ceiling = max(total_ceiling, idle_timeout)
+                        timeout_cause = {"total_exhausted": False, "progress_observed": False}
+
+                        def _timeout_cause(total_exhausted, progress_observed):
+                            timeout_cause.update(total_exhausted=total_exhausted,
+                                                 progress_observed=progress_observed)
+
+                        def _native_timeout(idle, waited, since_progress):
+                            _report_compression_timeout(
+                                self, idle=idle, waited=waited, since_progress=since_progress,
+                                total_ceiling=total_ceiling, **timeout_cause,
                             )
-                        except Exception:
-                            logger.warning("Native pre-summary attempt failed; using ordinary compression", exc_info=True)
-                            native_ok = False
-                        if native_ok:
-                            self._native_maintenance_committed = True
-                            return list(messages), getattr(self, "_cached_system_prompt", None) or system_message
-            # A revoked hygiene/interrupt fence also forbids the summary fallback.
-            if active_fence.is_cancelled:
+
+                        from agent.conversation_compression import run_compress_context_with_progress_timeout
+                        native_result = run_compress_context_with_progress_timeout(
+                            worker=_native_worker, messages=messages,
+                            system_prompt_fallback=lambda: native_prompt,
+                            idle_timeout_seconds=idle_timeout, total_ceiling_seconds=total_ceiling,
+                            on_timeout=_native_timeout, on_timeout_cause=_timeout_cause,
+                            on_commit_overrun=lambda waited, ceiling: _warn_commit_overrun(self, waited, ceiling),
+                            fence=active_fence, telemetry_agent=self, stall_fallback=False,
+                            interrupt_check=lambda: getattr(self, "_interrupt_requested", False),
+                        )
+                    if native_result[0] is not messages:
+                        self._native_maintenance_committed = True
+                        _sync_persisted_markers(messages, native_result[0])
+                        return native_result
+                    if getattr(active_fence, "_native_abort_fallback", False):
+                        self._native_maintenance_abort_fallback = True
+                        return messages, system_message
+                    if active_fence.is_cancelled:
+                        self._native_maintenance_abort_fallback = True
+                        return messages, system_message
+            # A revoked fence, stale watermark, or interrupted native request does
+            # not authorize an ordinary fallback on the old input.
+            if active_fence.is_cancelled or getattr(self, "_native_maintenance_abort_fallback", False):
                 return messages, system_message
 
             def _run(fence=None, target_messages=None, same_turn_fallback_recovery=False):

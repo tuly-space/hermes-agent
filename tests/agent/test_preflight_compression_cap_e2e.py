@@ -1,4 +1,4 @@
-"""E2E: compression.max_attempts=6 drives a 4th+ preflight compaction pass.
+"""E2E: compression.max_attempts=6 drives a 4th+ assembled pre-API pass.
 
 The turn-start preflight loop in ``agent/turn_context.py`` was hardcoded to
 ``range(3)``: even when every pass made real progress and the request stayed
@@ -130,7 +130,7 @@ def test_preflight_runs_fourth_compaction_pass_at_cap_six(monkeypatch, tmp_path)
 
     with (
         patch(
-            "agent.turn_context.estimate_request_tokens_rough",
+            "agent.model_metadata.estimate_messages_tokens_rough",
             side_effect=_shrinking_estimate,
         ),
         patch.object(agent, "_compress_context", side_effect=_fake_compress),

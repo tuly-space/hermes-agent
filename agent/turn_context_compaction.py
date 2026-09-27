@@ -130,13 +130,26 @@ def run_turn_start_compaction(
     active_system_prompt: Optional[str], conversation_history: Optional[List[Dict[str, Any]]],
     current_turn_user_idx: int, user_message: Any, effective_task_id: str,
 ) -> CompactionOutcome:
-    """Idle compaction, then preflight compression (or the uncompressed guard)."""
+    """Stage the idle gap for the assembled request gate; do not compress before
+    the inbound user context and crash-resilient row are prepared."""
     out = CompactionOutcome(
         messages=messages, active_system_prompt=active_system_prompt,
         conversation_history=conversation_history, current_turn_user_idx=current_turn_user_idx,
     )
-    _idle_compaction(agent, out, system_message, user_message, effective_task_id)
-    _preflight_compression(agent, out, system_message, user_message, effective_task_id)
+    agent._auto_compaction_idle_gap = None
+    idle_after = getattr(agent, "compression_idle_compact_after_seconds", 0)
+    if agent.compression_enabled and idle_after > 0 and current_turn_user_idx > 0:
+        prior = messages[:current_turn_user_idx]
+        stamp = prior[-1].get("timestamp") if prior else None
+        last = float(stamp) if isinstance(stamp, (int, float)) else getattr(
+            agent, "_idle_previous_activity_ts", getattr(agent, "_last_activity_ts", time.time()))
+        gap = time.time() - last
+        if gap >= idle_after:
+            agent._auto_compaction_idle_gap = gap
+    agent._turn_received_provider_response = False
+    agent._turn_preflight_display_snapshot = None
+    if not agent.compression_enabled:
+        _rearm_uncompressed_overflow_warn(agent, messages, active_system_prompt)
     return out
 
 

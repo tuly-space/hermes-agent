@@ -1354,42 +1354,10 @@ class GatewayTurnMixin:
         # Hygiene can never land with compression disabled; a sub-limit transcript is the identity (#111988).
         if not hs.compression_enabled:
             return self._bound_hygiene_payload(history, hs, session_entry)
-        plan = await self._hmwa_hygiene_plan(hs, history, session_entry, session_key)
-        # No compression this turn (under both thresholds, cooldown, or one already in flight): without
-        # the bound the model would get the full uncompressed transcript.
-        if not plan.needs_compress:
-            return self._bound_hygiene_payload(history, hs, session_entry)
-
-        attempt = self._HygieneAttempt(agent=None, meta=self._event_thread_metadata(event, source), history=history)
-        try:
-            _hyg_model, _hyg_runtime = self._resolve_session_agent_runtime(
-                source=source, session_key=session_key,
-                user_config=hs.data if isinstance(hs.data, dict) else None,
-            )
-            if str(_hyg_runtime.get("api_mode") or "").lower() == "codex_app_server":
-                await self._hmwa_hygiene_codex_compaction(hs, plan, history, session_entry, session_key, _hyg_runtime)
-            elif _hyg_runtime.get("api_key"):
-                # Pass the FULL transcript (tool results included) as the agent loop does: filtering
-                # to user/assistant starved the compressor (tool results are the bulk of context).
-                _hyg_msgs = [m for m in history if m.get("role") in {"user", "assistant", "tool"}]
-                if len(_hyg_msgs) >= 4:
-                    await self._hmwa_hygiene_detached_attempt(
-                        attempt, hs, plan, history, _hyg_msgs, _hyg_model, _hyg_runtime,
-                        source, session_entry, session_key, _quick_key, run_generation,
-                    )
-        except HygieneTurnHoldExceeded:
-            # Availability boundary, not a failure — already logged at INFO by the turn-hold handler.
-            # Must not hit the generic "auto-compress failed" warning below: that log is how thinking-model
-            # deployments read as permanently broken (#97963; surfaced by @686f6c61 in PR #99657).
-            pass
-        except Exception as e:
-            logger.warning("Session hygiene auto-compress failed: %s", e)
-        # A landed compression published a NEW transcript on attempt.history: leave it byte-identical.
-        # Anything else (turn-hold, timeout, unwind, codex path) left the FULL uncompressed transcript
-        # there — that is the fail-closed case (#111988).
-        if attempt.history is history:
-            return self._bound_hygiene_payload(history, hs, session_entry)
-        return attempt.history
+        # The agent's assembled pre-API gate owns all automatic admission (including the
+        # hard message limit). Do not run the detached hygiene compressor here: it would
+        # race the turn's native-first chain and duplicate its summary/status.
+        return history
 
     @staticmethod
     def _bound_hygiene_payload(history, hs, session_entry):

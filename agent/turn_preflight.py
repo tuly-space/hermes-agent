@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional
 
 from agent.context_engine import automatic_compaction_status_message
 from agent.conversation_compression import (
+    IDLE_COMPACTION_STATUS_TEMPLATE, PREFLIGHT_COMPRESSION_STATUS_TEMPLATE,
     PRE_API_COMPRESSION_STATUS_TEMPLATE, _reset_read_dedup_caches, compression_blocked_transiently,
     compression_skipped_due_to_lock, context_compression_timed_out,
     conversation_history_after_compression, ensure_compression_feasibility_checked,
@@ -56,6 +57,7 @@ class PreflightGateVerdict:
 
 def run_preflight_compression(
     agent: Any, v: PreflightGateVerdict, *, compressor: Any, request_pressure_tokens: int,
+    api_messages: Any = None, previous_preflight_pressure: Any = None,
     provider_overflow_preflight: bool, defer_preflight: Any, moa_prepared_request: Any,
     system_message: Any, user_message: Any, max_compression_attempts: int, effective_task_id: Any,
 ) -> PreflightGateVerdict:
@@ -72,6 +74,9 @@ def run_preflight_compression(
         _should_skip_model_call_for_reference_handoff,
     )
     from agent.native_maintenance import before_summary as _native_first_ready
+    from agent.codex_responses_adapter import (
+        effective_native_responses_message_count, has_replayable_native_compaction_checkpoint,
+    )
 
     def _done(action: str, result: Optional[Dict[str, Any]] = None) -> PreflightGateVerdict:
         v.action, v.result = action, result
@@ -94,14 +99,84 @@ def run_preflight_compression(
     if _eligible:
         # Aux clamp must land before the first compaction fires on the main-window threshold (#114707).
         ensure_compression_feasibility_checked(agent, request_pressure_tokens)
+    # Consume the idle candidate exactly once, on the first fully assembled request.
+    idle_gap = getattr(agent, "_auto_compaction_idle_gap", None)
+    agent._auto_compaction_idle_gap = None
+    idle_reason = False
+    if (isinstance(idle_gap, (int, float)) and idle_gap > 0
+            and not getattr(compressor, "awaiting_real_usage_after_compression", False)):
+        from agent.turn_context import _should_idle_compact
+        last = getattr(compressor, "last_compression_rough_tokens", 0)
+        idle_reason = _should_idle_compact(
+            enabled=agent.compression_enabled,
+            idle_after_seconds=getattr(agent, "compression_idle_compact_after_seconds", 0),
+            idle_gap_seconds=idle_gap, tokens=request_pressure_tokens,
+            floor_tokens=int(compressor.threshold_tokens * compressor.summary_target_ratio),
+            cooldown_active=bool(_compression_cooldown),
+            last_compaction_tokens=last if type(last) is int else 0,
+        )
+    request_messages = api_messages if api_messages is not None else v.messages
+    if request_messages and request_messages[0].get("role") == "system":
+        request_messages = request_messages[1:]
+    effective_count = effective_native_responses_message_count(agent, request_messages)
+    if effective_count is None:
+        effective_count = len(request_messages)
+    hard_limit = getattr(agent, "compression_hard_message_limit", 5000)
+    count_reason = effective_count >= hard_limit > 0
+    token_reason = compressor.should_compress(request_pressure_tokens) if _eligible else False
+    # Context engines may request sub-threshold maintenance; consult them at this
+    # same gate, never during the turn-start construction.
+    engine_reason = False
+    engine_preflight = getattr(compressor, "should_compress_preflight", None)
+    _native_ready = _native_first_ready(agent, v.messages)
+    deferred = (previous_preflight_pressure is None
+                and not getattr(agent, "_request_pressure_anchored", False)
+                and not _native_ready and defer_preflight(request_pressure_tokens))
+    app_server_native = (
+        getattr(agent, "api_mode", None) == "codex_app_server"
+        and str(getattr(agent, "codex_app_server_auto_compaction", "native") or "native").lower()
+        in {"native", "off"}
+    )
+    if (_eligible and not (token_reason or idle_reason or count_reason)
+            and callable(engine_preflight) and not _compression_cooldown
+            and not deferred and not app_server_native):
+        try:
+            engine_reason = bool(engine_preflight(v.messages))
+        except Exception:
+            logger.debug("engine preflight maintenance failed", exc_info=True)
+    reasons = [name for name, hit in (
+        ("idle", idle_reason), ("tokens", token_reason),
+        ("message_count", count_reason), ("engine", engine_reason),
+    ) if hit]
+    # A checkpoint's ciphertext and archived transcript are not fresh usage. The
+    # first ordinary response must price it before ANY automatic second pass.
+    awaiting_checkpoint = (bool(getattr(compressor, "awaiting_real_usage_after_compression", False))
+                           and has_replayable_native_compaction_checkpoint(agent, v.messages))
+    # The old turn-start gate took a display-only snapshot before speculative
+    # seeding; an interrupted turn rolls it back in the finalizer.
+    if _eligible and not getattr(agent, "_turn_received_provider_response", False):
+        if getattr(agent, "_turn_preflight_display_snapshot", None) is None:
+            snapshot = getattr(compressor, "snapshot_preflight_display_tokens", None)
+            if callable(snapshot):
+                value = snapshot()
+                if type(value) is int:
+                    agent._turn_preflight_display_snapshot = value
+        if not deferred and not awaiting_checkpoint:
+            seed = getattr(compressor, "maybe_seed_preflight_display_tokens", None)
+            if callable(seed):
+                seed(request_pressure_tokens)
     if (
         _eligible
+        and reasons
+        and (not awaiting_checkpoint or provider_overflow_preflight)
+        and not getattr(agent, "_interrupt_requested", False)
         and not _review_fork_first_request_pending(agent)
         and (not v._preflight_compression_blocked or provider_overflow_preflight)
-        and (not defer_preflight(request_pressure_tokens) or provider_overflow_preflight
-             or _native_first_ready(agent, v.messages))
+        and (not deferred or provider_overflow_preflight or idle_reason or count_reason or engine_reason)
         and not _compression_cooldown
-        and compressor.should_compress(request_pressure_tokens)
+        and not app_server_native
+        and not (callable(getattr(compressor, "_automatic_compression_blocked", None))
+                 and compressor._automatic_compression_blocked())
     ):
         # Managed local runtime: grow the context window before compressing (last
         # resort). Only for a llamacpp provider at the supervised base_url.
@@ -121,28 +196,42 @@ def run_preflight_compression(
         _threshold = int(getattr(compressor, "threshold_tokens", 0) or 0)
         _context_length = int(getattr(compressor, "context_length", 0) or 0)
         logger.info(
-            "Pre-API compression: ~%s request tokens >= %s threshold "
-            "(context=%s, attempt=%s/%s)",
+            "Automatic pre-API compression: reasons=%s effective_messages=%s/%s "
+            "~%s request tokens threshold=%s (context=%s, attempt=%s/%s)",
+            ",".join(reasons), effective_count, hard_limit,
             f"{request_pressure_tokens:,}",
             f"{_threshold:,}",
             f"{_context_length:,}" if getattr(compressor, "context_length", 0) else "unknown",
             v.compression_attempts,
             max_compression_attempts,
         )
+        _status_phase = "idle" if idle_reason else (
+            "preflight" if not getattr(agent, "_turn_received_provider_response", False) else "pre_api"
+        )
+        _status_template = (
+            IDLE_COMPACTION_STATUS_TEMPLATE.format(
+                idle_seconds=int(idle_gap or 0), tokens=request_pressure_tokens
+            ) if idle_reason else (
+                PREFLIGHT_COMPRESSION_STATUS_TEMPLATE.format(
+                    tokens=request_pressure_tokens, threshold=_threshold
+                ) if _status_phase == "preflight" and token_reason else PRE_API_COMPRESSION_STATUS_TEMPLATE.format(
+                    tokens=request_pressure_tokens
+                )
+            )
+        )
         _pre_api_status = automatic_compaction_status_message(
             compressor,
-            phase="pre_api",
-            default_message=PRE_API_COMPRESSION_STATUS_TEMPLATE.format(
-                tokens=request_pressure_tokens
-            ),
+            phase=_status_phase,
+            default_message=_status_template,
             approx_tokens=request_pressure_tokens,
+            idle_seconds=int(idle_gap or 0) if idle_reason else None,
             threshold_tokens=_threshold,
             context_length=_context_length,
             model=agent.model,
             attempt=v.compression_attempts,
             max_attempts=max_compression_attempts,
         )
-        if _pre_api_status:
+        if _pre_api_status and previous_preflight_pressure is None:
             agent._emit_status(_pre_api_status)
         v._last_preflight_pressure = request_pressure_tokens
         _pre_api_input = v.messages
@@ -159,6 +248,13 @@ def run_preflight_compression(
             v._compression_timeout_exhausted = True
             v._turn_exit_reason = "context_compression_timeout"
             return _done("break")
+        if getattr(agent, "_native_maintenance_abort_fallback", False):
+            # A refused checkpoint means cancelled/stale input, not an ordinary
+            # lock skip. Never send (or repersist) that old request.
+            v.api_call_count = _refund_api_call(agent, v.api_call_count)
+            return _done("return", _compression_deferred_result(
+                agent, v.messages, v.api_call_count, reason="transient_block"
+            ))
         if v.messages is _pre_api_input and (
             compression_skipped_due_to_lock(agent) or compression_blocked_transiently(agent)
         ):
@@ -202,15 +298,21 @@ def run_preflight_compression(
         # All recovery passes consumed and still over threshold: fail closed —
         # llama.cpp may silently truncate an oversized retry.
         return _done("return", _exhausted_result())
-    elif _eligible and not defer_preflight(request_pressure_tokens) and _compression_cooldown:
-        # Summary-LLM cooldown blocks compression: deduped warning only when over
-        # threshold (should_compress_info reason is None below it).
-        _block_reason = _blocked_compress_reason(compressor, request_pressure_tokens)
+    elif (agent.compression_enabled and len(v.messages) > 1 and not deferred
+          and not awaiting_checkpoint and not app_server_native):
+        # Name structural backoff, failure cooldown, and spent attempt budget;
+        # a sub-threshold healthy turn re-arms the warning dedup.
+        _block_reason = _blocked_compress_reason(
+            compressor, request_pressure_tokens, attempts_spent=v.compression_attempts
+            if v.compression_attempts >= max_compression_attempts else None,
+        )
         if _block_reason:
             agent._warn_context_overflow_blocked(
                 _block_reason, request_pressure_tokens,
                 int(getattr(compressor, "threshold_tokens", 0) or 0),
             )
+        elif request_pressure_tokens < getattr(compressor, "threshold_tokens", 0):
+            _clear_overflow_warn(agent)
     elif not agent.compression_enabled and len(v.messages) > 1:
         # Uncompressed session guard: compression is disabled, so warn (deduped) when
         # the request exceeds the context window; the turn-context preflight re-arms.
@@ -220,6 +322,31 @@ def run_preflight_compression(
             if callable(_warn_fn):
                 _warn_fn(request_pressure_tokens, _ctx_len)
 
+    if (count_reason and agent.compression_enabled and not awaiting_checkpoint
+            and not provider_overflow_preflight and not _review_fork_first_request_pending(agent)):
+        # A hard-limit skip cannot send the oversized full transcript (the Gateway
+        # no longer truncates it before the agent gets the chance to compress).
+        v.api_call_count = _refund_api_call(agent, v.api_call_count)
+        agent._persist_session(v.messages, v.conversation_history)
+        return _done("return", _compression_deferred_result(
+            agent, v.messages, v.api_call_count, reason="transient_block"
+        ))
+    if (v.messages and v.messages[-1].get("role") == "tool"
+            and agent.compression_enabled and not awaiting_checkpoint):
+        # Retain the deterministic tool-only prune, but run it at the next
+        # pre-API decision rather than in the post-tool executor.
+        prune = getattr(compressor, "prune_tool_results_only", None)
+        if callable(prune):
+            try:
+                pruned, reclaimed = prune(v.messages, current_tokens=request_pressure_tokens)
+            except Exception:
+                logger.debug("proactive tool-result prune failed; skipping", exc_info=True)
+            else:
+                if reclaimed and pruned is not v.messages:
+                    v.messages = pruned
+                    _reset_read_dedup_caches(effective_task_id, session_id=agent.session_id or "")
+                    v.api_call_count = _refund_api_call(agent, v.api_call_count)
+                    return _done("continue")
     if provider_overflow_preflight:
         # Any other gate blocking the forced preflight (e.g. uncompressible one-
         # message request) must fail closed: the request is proven not to fit.

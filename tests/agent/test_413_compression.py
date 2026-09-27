@@ -774,15 +774,13 @@ class TestPreflightCompression:
         status_messages = []
         agent.status_callback = lambda ev, msg: status_messages.append((ev, msg))
 
-        _rough_calls = {"n": 0}
-
-        def _rough_estimate(*_args, **_kwargs):
-            _rough_calls["n"] += 1
-            return 114_000 if _rough_calls["n"] == 1 else 40_000
+        def _rough_estimate(messages, **_kwargs):
+            # Follow the actual request contents, not calls at the retired prologue.
+            return 114_000 if len(messages) >= 40 else 40_000
 
         with (
-            patch("agent.turn_context.estimate_request_tokens_rough", side_effect=_rough_estimate),
-            patch("agent.model_metadata.estimate_request_tokens_rough", side_effect=_rough_estimate),
+            patch("agent.model_metadata.estimate_messages_tokens_rough", side_effect=_rough_estimate),
+            patch("agent.conversation_loop._estimate_tools_tokens_rough", return_value=0),
             patch.object(agent, "_compress_context") as mock_compress,
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
@@ -826,15 +824,13 @@ class TestPreflightCompression:
         status_messages = []
         agent.status_callback = lambda ev, msg: status_messages.append((ev, msg))
 
-        _rough_calls = {"n": 0}
-
-        def _rough_estimate(*_args, **_kwargs):
-            _rough_calls["n"] += 1
-            return 114_000 if _rough_calls["n"] == 1 else 40_000
+        def _rough_estimate(messages, **_kwargs):
+            # Follow the actual request contents, not calls at the retired prologue.
+            return 114_000 if len(messages) >= 40 else 40_000
 
         with (
-            patch("agent.turn_context.estimate_request_tokens_rough", side_effect=_rough_estimate),
-            patch("agent.model_metadata.estimate_request_tokens_rough", side_effect=_rough_estimate),
+            patch("agent.model_metadata.estimate_messages_tokens_rough", side_effect=_rough_estimate),
+            patch("agent.conversation_loop._estimate_tools_tokens_rough", return_value=0),
             patch.object(agent, "_compress_context") as mock_compress,
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
@@ -1205,7 +1201,6 @@ class TestPreflightCompression:
         speculative display snapshot.
         """
         agent.compression_enabled = True
-        agent._interrupt_requested = True
         agent.context_compressor.context_length = 200_000
         agent.context_compressor.threshold_tokens = 130_000
         agent.context_compressor.last_prompt_tokens = 74_400
@@ -1223,6 +1218,8 @@ class TestPreflightCompression:
             agent.context_compressor.compression_count += 1
             agent.context_compressor._ineffective_compression_count = 2
             agent.context_compressor._last_compression_savings_pct = 0.0
+            # Interrupt after the successful commit, not before the request gate.
+            agent._interrupt_requested = True
             return msgs, agent._cached_system_prompt
 
         with (
@@ -1465,15 +1462,10 @@ class TestToolResultPreflightCompression:
         )
         agent.client.chat.completions.create.side_effect = [tool_resp, ok_resp]
 
-        # First provider request is small. The post-tool check's raw-message
-        # estimate (the inner call made by ``estimate_request_tokens_rough``)
-        # stays well under threshold, but the tool result pushes the fully
-        # assembled pre-API request over it; rebuilding after compression only
-        # trims it from 150K to 148K. Raw-message estimation is much smaller,
-        # which previously made the no-op pass look successful and allowed two
-        # more immediate summaries.
+        # Measure assembled requests: initial, post-tool, then post-summary.
+        # A marginal reduction must not allow repeated immediate summaries.
         assembled_estimates = iter(
-            [1_000, 25_000, 150_000, 148_000, 148_000, 148_000]
+            [1_000, 150_000, 148_000, 148_000, 148_000]
         )
 
         with (

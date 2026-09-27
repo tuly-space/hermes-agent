@@ -1047,10 +1047,13 @@ def _run_pinned_compression_retry(
 
 
 def _await_worker_within_budget(
-    future: Any, fence: CompressionCommitFence, *, idle: float, ceiling: float, wait_started: float
+    future: Any, fence: CompressionCommitFence, *, idle: float, ceiling: float, wait_started: float,
+    interrupt_check=None,
 ) -> Tuple[bool, Any]:
     """Poll ``future`` under the idle budget + ceiling; ``(True, result)`` when it settled."""
     while True:
+        if interrupt_check is not None and interrupt_check():
+            return False, None
         waited = time.monotonic() - wait_started
         remaining_ceiling = ceiling - waited
         if remaining_ceiling <= 0:
@@ -1058,6 +1061,8 @@ def _await_worker_within_budget(
         # Charge idle budget from LAST PROGRESS, not slice start, or silence could approach 2x the budget.
         since_progress = fence.seconds_since_progress()
         wait_slice = min(max(idle - since_progress, 0.005), remaining_ceiling)
+        if interrupt_check is not None:
+            wait_slice = min(wait_slice, 0.1)
         try:
             return True, future.result(timeout=wait_slice)
         except concurrent.futures.TimeoutError:
@@ -1072,6 +1077,8 @@ def _await_worker_within_budget(
             waited = time.monotonic() - wait_started
             since_progress = fence.seconds_since_progress()
             if not fence.deadline_exceeded and since_progress < idle and waited < ceiling:
+                if interrupt_check is not None:
+                    continue
                 logger.info(
                     "Context compression still streaming after %.0fs (last progress %.1fs ago) — extending wait (ceiling %.0fs)",
                     waited, since_progress, ceiling,
@@ -1166,6 +1173,7 @@ def run_compress_context_with_progress_timeout(
     new_fence: Optional[Callable[[], CompressionCommitFence]] = None,
     fallback_worker: Optional[Callable[[CompressionCommitFence], Tuple[list, str]]] = None,
     request_exceeds_window: bool = False,
+    interrupt_check=None,
 ) -> Tuple[list, str]:
     """Run ``worker(fence)`` under a sync progress-aware (idle + ceiling) timeout.
     Budgets bound the PRE-commit phase only: an admitted commit always completes (overrun logged, surfaced
@@ -1250,7 +1258,8 @@ def run_compress_context_with_progress_timeout(
     handled_exit = False
     try:
         settled, result = _await_worker_within_budget(
-            future, fence, idle=idle, ceiling=ceiling, wait_started=wait_started
+            future, fence, idle=idle, ceiling=ceiling, wait_started=wait_started,
+            interrupt_check=interrupt_check,
         )
         if settled:
             handled_exit = True
@@ -1259,6 +1268,7 @@ def run_compress_context_with_progress_timeout(
         # F6: a not-yet-started future must not linger as a stale queued job.
         # cancel() is a no-op for a running worker (fence handles that path).
         future.cancel()
+        interrupted = interrupt_check is not None and interrupt_check()
         total_exhausted = time.monotonic() - wait_started >= ceiling or fence.deadline_exceeded
         # #97488 teardown (total-ceiling path only): give the cancelled worker a bounded grace to actually
         # exit before this host moves on. The worker checks the poison fence between provider phases, so a
@@ -1286,6 +1296,8 @@ def run_compress_context_with_progress_timeout(
         # the holder-qualified hook so a NEW compressor can acquire at once (no ABA).
         handled_exit = True
         _release_cancelled_worker(future, fence, total_exhausted=total_exhausted, ceiling=ceiling)
+        if interrupted:
+            return messages, _resolve_fallback_prompt()
         waited = time.monotonic() - wait_started
         # #76354 S3 analogue for this wait: charge the idle budget from the LAST PROGRESS event, not from
         # the start of this wait slice. Waiting a full ``idle`` after progress that landed early in the

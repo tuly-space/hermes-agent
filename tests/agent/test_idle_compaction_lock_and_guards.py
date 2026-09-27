@@ -92,6 +92,28 @@ def _history(n: int = 20) -> list:
     return [{"role": "user", "content": f"m{i}"} for i in range(n)]
 
 
+def _run_assembled(agent, history, rough_tokens):
+    """Exercise the post-injection request gate, not the turn-start staging pass."""
+    history = [{**message, "role": "user" if i % 2 == 0 else "assistant",
+                "timestamp": time.time() - 3600} for i, message in enumerate(history)]
+    agent.client = MagicMock()
+    agent.client.chat.completions.create.return_value = types.SimpleNamespace(
+        choices=[types.SimpleNamespace(message=types.SimpleNamespace(
+            content="done", reasoning_content=None, reasoning=None, tool_calls=None),
+            finish_reason="stop")], usage=None)
+    agent._disable_streaming = True
+    agent._use_prompt_caching = False
+    agent.save_trajectories = False
+    agent.context_compressor.should_compress.return_value = False
+    agent.context_compressor.should_compress_preflight.return_value = False
+    agent.context_compressor.should_defer_preflight_to_real_usage.return_value = False
+    agent.context_compressor._automatic_compression_blocked.return_value = False
+    with patch("agent.model_metadata.estimate_messages_tokens_rough", return_value=rough_tokens):
+        result = agent.run_conversation("hello again", conversation_history=history)
+    assert result["final_response"] == "done"
+    return result
+
+
 
 
 
@@ -109,7 +131,7 @@ def test_idle_compaction_status_emitted_by_default(tmp_path: Path) -> None:
     events = []
     agent.status_callback = lambda ev, msg: events.append((ev, msg))
 
-    _run_prologue(agent, _history())
+    _run_assembled(agent, _history(), 999_999)
 
     agent.context_compressor.compress.assert_called_once()
     assert any(
@@ -254,7 +276,7 @@ def test_idle_compaction_fires_again_once_the_transcript_grows(tmp_path: Path) -
     seam = _pin_compress_seam(agent)
 
     # 44,579 + 25,502 = 70,081 — one floor's worth of new content on top.
-    _run_prologue(agent, _history(), rough_tokens=70_082)
+    _run_assembled(agent, _history(), rough_tokens=70_082)
 
     seam.assert_called_once()
 
@@ -277,7 +299,7 @@ def test_idle_compaction_ignores_a_non_int_last_compaction_reading(
     )
     seam = _pin_compress_seam(agent)
 
-    _run_prologue(agent, _history(), rough_tokens=44_579)
+    _run_assembled(agent, _history(), rough_tokens=44_579)
 
     seam.assert_called_once()
 
