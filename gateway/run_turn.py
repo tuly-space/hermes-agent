@@ -1737,10 +1737,10 @@ class GatewayTurnMixin:
         # from #49874).
         if agent_result.get("compression_deferred"):
             logger.info(
-                "Compression deferred for session %s — the compression "
-                "lock is held by a concurrent compressor. Keeping the "
+                "Compression deferred for session %s (reason=%s). Keeping the "
                 "session intact; the next message retries normally.",
                 session_entry.session_id if session_entry else "?",
+                agent_result.get("compression_deferred_reason") or "unspecified",
             )
         elif agent_result.get("compression_exhausted") and session_entry and session_key:
             logger.info("Auto-resetting session %s after compression exhaustion.", session_entry.session_id)

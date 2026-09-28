@@ -1001,8 +1001,24 @@ def _compression_deferred_result(agent, messages: List[Dict], api_call_count: in
     ``compression_deferred``, never ``compression_exhausted`` — the gateway wipes the
     session on exhaustion (#9893/#35809). ``failed`` stays False; the turn persists."""
     session = agent.session_id or "none"
-    if reason == "transient_block":
+    detail = reason
+    if reason == "native_abort":
+        block = getattr(agent, "_native_maintenance_abort_reason", None)
+        detail = block if isinstance(block, str) and block else "native_abort"
+        logger.info("turn deferred: native compression refused (%s) (session=%s)", detail, session)
+        _final = (
+            "Context compression could not safely continue this turn. "
+            "Your conversation is preserved; please retry."
+        )
+    elif reason == "message_limit":
+        logger.info("turn deferred: request message limit still exceeded (session=%s)", session)
+        _final = (
+            "The request still exceeds the message limit and could not be compressed this turn. "
+            "Your conversation is preserved; please retry or run /compress."
+        )
+    elif reason == "transient_block":
         block = getattr(agent, "_compression_blocked_transient", None)
+        detail = block if isinstance(block, str) and block else reason
         logger.info(
             "turn deferred: compression transiently blocked (%s) (session=%s) — not counting as "
             "compression exhaustion", block if isinstance(block, str) else "unknown guard", session,
@@ -1027,7 +1043,7 @@ def _compression_deferred_result(agent, messages: List[Dict], api_call_count: in
         pass
     return _partial_turn_result(
         _final, messages, api_call_count,
-        failed=False, compression_deferred=True, session_id=agent.session_id,
+        failed=False, compression_deferred=True, compression_deferred_reason=detail, session_id=agent.session_id,
     )
 
 

@@ -128,7 +128,7 @@ def run_preflight_compression(
     # same gate, never during the turn-start construction.
     engine_reason = False
     engine_preflight = getattr(compressor, "should_compress_preflight", None)
-    _native_ready = _native_first_ready(agent, v.messages)
+    _native_ready = _native_first_ready(agent, request_messages)
     deferred = (previous_preflight_pressure is None
                 and not getattr(agent, "_request_pressure_anchored", False)
                 and not _native_ready and defer_preflight(request_pressure_tokens))
@@ -150,8 +150,12 @@ def run_preflight_compression(
     ) if hit]
     # A checkpoint's ciphertext and archived transcript are not fresh usage. The
     # first ordinary response must price it before ANY automatic second pass.
+    # Match checkpoint coverage against the SAME normalized send view used for
+    # pressure/count above and native checkpoint generation, never raw history.
+    # Raw whitespace/tool-call metadata can otherwise reject a valid checkpoint
+    # and trigger another compaction before its first real usage arrives.
     awaiting_checkpoint = (bool(getattr(compressor, "awaiting_real_usage_after_compression", False))
-                           and has_replayable_native_compaction_checkpoint(agent, v.messages))
+                           and has_replayable_native_compaction_checkpoint(agent, request_messages))
     # The old turn-start gate took a display-only snapshot before speculative
     # seeding; an interrupted turn rolls it back in the finalizer.
     if _eligible and not getattr(agent, "_turn_received_provider_response", False):
@@ -253,7 +257,7 @@ def run_preflight_compression(
             # lock skip. Never send (or repersist) that old request.
             v.api_call_count = _refund_api_call(agent, v.api_call_count)
             return _done("return", _compression_deferred_result(
-                agent, v.messages, v.api_call_count, reason="transient_block"
+                agent, v.messages, v.api_call_count, reason="native_abort"
             ))
         if v.messages is _pre_api_input and (
             compression_skipped_due_to_lock(agent) or compression_blocked_transiently(agent)
@@ -329,7 +333,7 @@ def run_preflight_compression(
         v.api_call_count = _refund_api_call(agent, v.api_call_count)
         agent._persist_session(v.messages, v.conversation_history)
         return _done("return", _compression_deferred_result(
-            agent, v.messages, v.api_call_count, reason="transient_block"
+            agent, v.messages, v.api_call_count, reason="message_limit"
         ))
     if (v.messages and v.messages[-1].get("role") == "tool"
             and agent.compression_enabled and not awaiting_checkpoint):

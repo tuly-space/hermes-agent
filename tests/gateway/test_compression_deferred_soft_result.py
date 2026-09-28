@@ -20,6 +20,10 @@ from __future__ import annotations
 
 import ast
 import inspect
+import logging
+from types import SimpleNamespace
+
+import pytest
 
 from gateway import run as gateway_run
 from gateway import run_turn as gateway_run_turn
@@ -62,6 +66,19 @@ def _find_deferred_guarded_reset_chain() -> ast.If:
         "soft-defer contract (#49874: lock-contended defer must never "
         "auto-reset the session) is no longer structurally guaranteed."
     )
+
+
+@pytest.mark.parametrize("reason", [None, "lock", "watermark_mismatch", "message_limit"])
+def test_deferred_log_preserves_actual_reason(caplog, reason):
+    node = _find_deferred_guarded_reset_chain()
+    code = compile(ast.fix_missing_locations(ast.Module(body=node.body, type_ignores=[])),
+                   "<gateway-deferred-branch>", "exec")
+    with caplog.at_level(logging.INFO):
+        exec(code, {"agent_result": {"compression_deferred_reason": reason},
+                    "session_entry": SimpleNamespace(session_id="test-session"),
+                    "logger": logging.getLogger("gateway.run")})
+    assert f"reason={reason or 'unspecified'}" in caplog.text
+    assert "lock is held" not in caplog.text
 
 
 class TestCompressionDeferredIsSoft:

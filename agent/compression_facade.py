@@ -244,6 +244,7 @@ class CompressionFacadeMixin:
         reset_context_compression_timeout_outcome(self)
         self._native_maintenance_committed = False
         self._native_maintenance_abort_fallback = False
+        self._native_maintenance_abort_reason = None
         from agent.portal_tags import (
             get_affinity_scope, get_conversation_context, reset_affinity_scope, reset_conversation_context,
             set_affinity_scope, set_conversation_context,
@@ -289,10 +290,12 @@ class CompressionFacadeMixin:
                         if db is not None and sid and holder:
                             if self._flush_messages_to_session_db(messages) is False:
                                 self._native_maintenance_abort_fallback = True
+                                self._native_maintenance_abort_reason = "input_persist_failed"
                                 return messages, system_message
                         watermark = db.get_active_message_watermark(sid) if db is not None and sid else None
                     except Exception:
                         self._native_maintenance_abort_fallback = True
+                        self._native_maintenance_abort_reason = "input_persist_error"
                         logger.warning("Native maintenance input could not be persisted", exc_info=True)
                         return messages, system_message
 
@@ -345,9 +348,11 @@ class CompressionFacadeMixin:
                         return native_result
                     if getattr(active_fence, "_native_abort_fallback", False):
                         self._native_maintenance_abort_fallback = True
+                        self._native_maintenance_abort_reason = getattr(active_fence, "_native_abort_reason", None)
                         return messages, system_message
                     if active_fence.is_cancelled:
                         self._native_maintenance_abort_fallback = True
+                        self._native_maintenance_abort_reason = "commit_admission_revoked"
                         return messages, system_message
             # A revoked fence, stale watermark, or interrupted native request does
             # not authorize an ordinary fallback on the old input.

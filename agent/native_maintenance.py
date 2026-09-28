@@ -59,17 +59,28 @@ def attempt(agent: Any, messages: list[dict], system_prompt: str, before_tokens:
     The SDK's high-level stream loses output_item.done on an empty completed.output,
     so consume the raw events with the production assembler. No output is delivered.
     """
-    def _abort_fallback():
+    def _abort_fallback(reason):
         # A detached worker must not poison a later turn's outcome on the agent.
         if commit_fence is not None:
             commit_fence._native_abort_fallback = True
+            commit_fence._native_abort_reason = reason
         else:
             agent._native_maintenance_abort_fallback = True
+            agent._native_maintenance_abort_reason = reason
+        logger.info("Native maintenance refused: phase=%s session=%s reason=%s",
+                    phase, getattr(agent, "session_id", None), reason)
 
     if commit_fence is not None:
         commit_fence._native_abort_fallback = False
-    if not eligible(agent) or not messages or getattr(agent, "_interrupt_requested", False):
-        _abort_fallback()
+        commit_fence._native_abort_reason = None
+    if not eligible(agent):
+        _abort_fallback("native_ineligible")
+        return False
+    if not messages:
+        _abort_fallback("empty_input")
+        return False
+    if getattr(agent, "_interrupt_requested", False):
+        _abort_fallback("interrupted")
         return False
     carrier = next((m for m in reversed(messages) if m.get("role") == "assistant"), None)
     if carrier is None:
@@ -81,23 +92,29 @@ def attempt(agent: Any, messages: list[dict], system_prompt: str, before_tokens:
         # A durable attempt must have a durable carrier. Never publish an ephemeral
         # checkpoint which disappears as soon as the agent is evicted.
         if not isinstance(expected_watermark, int):
-            _abort_fallback()
+            _abort_fallback("missing_watermark")
             return False
         # The checkpoint covers ALL input, not just its assistant carrier. An
         # unpersisted or changed tail would move its boundary and lose context.
         durable = db.get_messages_as_conversation(sid, repair_alternation=True, include_row_ids=True)
-        if (len(plain) != len(durable) or not durable
-                or durable[-1].get("_row_id") != expected_watermark
-                or any(m.get("role") != d.get("role")
-                       or db._loaded_view_content(m.get("role"), m.get("content")) != d.get("content")
-                       or m.get("tool_calls") != d.get("tool_calls") for m, d in zip(plain, durable))):
-            _abort_fallback()
+        if len(plain) != len(durable) or not durable:
+            _abort_fallback("transcript_length_mismatch")
             return False
+        if durable[-1].get("_row_id") != expected_watermark:
+            _abort_fallback("watermark_mismatch")
+            return False
+        for m, d in zip(plain, durable):
+            for field in ("role", "content", "tool_calls"):
+                value = (db._loaded_view_content(m.get("role"), m.get("content"))
+                         if field == "content" else m.get(field))
+                if value != d.get(field):
+                    _abort_fallback(f"transcript_{field}_mismatch")
+                    return False
         for m, d in zip(plain, durable):
             m["_row_id"] = d["_row_id"]
         row_id = carrier.get("_row_id")
         if not isinstance(row_id, int):
-            _abort_fallback()
+            _abort_fallback("missing_carrier_row")
             return False
     started = time.monotonic()
     client = stream = None
@@ -169,12 +186,12 @@ def attempt(agent: Any, messages: list[dict], system_prompt: str, before_tokens:
         kwargs = _sanitize_consumer_codex_request(agent, kwargs)
         kwargs["stream"] = True
         if commit_fence is not None and commit_fence.is_cancelled:
-            _abort_fallback()
+            _abort_fallback("commit_admission_revoked")
             reason = "commit_admission_revoked"
             return False
         client = agent._create_request_openai_client(reason="native_maintenance", api_kwargs=kwargs)
         if commit_fence is not None and commit_fence.is_cancelled:
-            _abort_fallback()
+            _abort_fallback("commit_admission_revoked")
             reason = "commit_admission_revoked"
             return False
         stream = client.responses.create(**bypass_sdk_request_transform(kwargs))
@@ -191,7 +208,7 @@ def attempt(agent: Any, messages: list[dict], system_prompt: str, before_tokens:
         result = _consume_codex_event_stream(
             stream, model=kwargs["model"], on_event=_terminal_event, interrupt_check=_interrupted)
         if _interrupted():
-            _abort_fallback()
+            _abort_fallback("commit_admission_revoked")
             reason = "commit_admission_revoked"
             return False
         input_tokens, cached_tokens, output_tokens = _usage(result.usage)
@@ -218,7 +235,7 @@ def attempt(agent: Any, messages: list[dict], system_prompt: str, before_tokens:
             checkpoint["_checkpoint_prefix_digest"] = _prefix_digest(covered)
         if commit_fence is not None and not commit_fence.begin_commit():
             reason = "commit_admission_revoked"
-            _abort_fallback()
+            _abort_fallback("commit_admission_revoked")
             return False
         try:
             if db is not None and sid and not getattr(agent, "_persist_disabled", False):
@@ -230,11 +247,11 @@ def attempt(agent: Any, messages: list[dict], system_prompt: str, before_tokens:
                 except Exception:
                     # A competing foreground admission is a refused CAS, never
                     # permission to begin an ordinary summary on stale input.
-                    _abort_fallback()
+                    _abort_fallback("checkpoint_commit_error")
                     raise
                 if not attached:
                     reason = "stale_transcript_or_lease"
-                    _abort_fallback()
+                    _abort_fallback(reason)
                     return False
             # Only mutate the in-memory sidecar AFTER the durable CAS succeeded.
             carrier["codex_reasoning_items"] = list(carrier.get("codex_reasoning_items") or []) + [checkpoint]

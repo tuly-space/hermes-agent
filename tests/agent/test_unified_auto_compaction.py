@@ -330,6 +330,11 @@ def test_native_refused_admission_never_sends_or_summarizes_stale_input(agent, m
                         lambda *a, **kw: pytest.fail("stale fallback summary"))
     result = instance.run_conversation("next", conversation_history=history)
     assert result.get("compression_deferred")
+    assert result["compression_deferred_reason"] == {
+        "cas_false": "stale_transcript_or_lease",
+        "cas_exception": "checkpoint_commit_error",
+        "stale_prefix": "transcript_content_mismatch",
+    }[failure]
     assert len(native_calls) == (0 if failure == "stale_prefix" else 1)
     assert not has_replayable_native_compaction_checkpoint(instance, db.get_messages_as_conversation("unified"))
 
